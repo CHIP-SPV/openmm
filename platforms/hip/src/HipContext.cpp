@@ -570,10 +570,10 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
 
     string cacheFile = getCacheFileName(src.str());
     hipModule_t module;
-    if (hipModuleLoad(&module, cacheFile.c_str()) == hipSuccess) {
-        loadedModules.push_back(module);
-        return module;
-    }
+    // if (hipModuleLoad(&module, cacheFile.c_str()) == hipSuccess) {
+    //     loadedModules.push_back(module);
+    //     return module;
+    // }
 
     // Select names for the various temporary files.
 
@@ -612,7 +612,7 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
     hiprtcProgram program;
     HIPRTC_CHECK_RESULT(hiprtcCreateProgram(&program, src.str().c_str(), NULL, 0, NULL, NULL), "Error creating program");
     try {
-        hiprtcResult result = hiprtcCompileProgram(program, optionsVec.size(), &optionsVec[0]);
+        hiprtcResult result = hiprtcCompileProgram(program, 0, &optionsVec[0]);
         if (result != HIPRTC_SUCCESS || saveTemps) {
             size_t logSize;
             hiprtcGetProgramLogSize(program, &logSize);
