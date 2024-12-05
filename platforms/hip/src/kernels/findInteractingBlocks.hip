@@ -438,12 +438,9 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE) void findBlocksWithInteracti
                 continue;
 #endif
             real3 blockSizeY = sortedBlockBoundingBox[block2].toReal3();
-            blockDelta.x = fabs(blockDelta.x)-blockSizeX.x-blockSizeY.x;
-            blockDelta.x = max(0, blockDelta.x);
-            blockDelta.y = fabs(blockDelta.y)-blockSizeX.y-blockSizeY.y;
-            blockDelta.y = max(0, blockDelta.y);
-            blockDelta.z = fabs(blockDelta.z)-blockSizeX.z-blockSizeY.z;
-            blockDelta.z = max(0, blockDelta.z);
+            blockDelta.x = max(0.0f, fabs(blockDelta.x)-blockSizeX.x-blockSizeY.x);
+            blockDelta.y = max(0.0f, fabs(blockDelta.y)-blockSizeX.y-blockSizeY.y);
+            blockDelta.z = max(0.0f, fabs(blockDelta.z)-blockSizeX.z-blockSizeY.z);
             includeBlock2 &= (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < PADDED_CUTOFF_SQUARED);
 #ifdef TRICLINIC
             // The calculation to find the nearest periodic copy is only guaranteed to work if the nearest copy is less than half a box width away.
