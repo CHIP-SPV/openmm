@@ -402,13 +402,15 @@ public:
      * Get the SIMD width of the device being used.
      */
     int getSIMDWidth() const {
-        return simdWidth;
+        return 32;
+        //return simdWidth;
     }
     /**
      * Get the number of multiprocessors (compute units) of the device being used.
      */
     int getMultiprocessors() const {
-        return multiprocessors;
+        return 60;
+        //return multiprocessors;
     }
     /**
      * Get whether the device being used supports 64 bit atomic operations on global memory.
@@ -620,6 +622,7 @@ private:
     int multiprocessors;
     int sharedMemPerBlock;
     bool supportsHardwareFloatGlobalAtomicAdd;
+    bool isIntelGPU;
     bool useBlockingSync, useDoublePrecision, useMixedPrecision, contextIsValid, boxIsTriclinic, hasAssignedPosqCharges;
     bool isLinkedContext;
     std::string tempDir, cacheDir, gpuArchitecture;

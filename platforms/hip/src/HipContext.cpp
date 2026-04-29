@@ -50,6 +50,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -88,7 +89,7 @@ bool HipContext::hasInitializedHip = false;
 HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSync, const string& precision, const string& tempDir, HipPlatform::PlatformData& platformData,
         HipContext* originalContext) : ComputeContext(system), currentStream(0), defaultStream(0), platformData(platformData), contextIsValid(false), hasAssignedPosqCharges(false),
         pinnedBuffer(NULL), integration(NULL), expression(NULL), bonded(NULL), nonbonded(NULL),
-        useBlockingSync(useBlockingSync), supportsHardwareFloatGlobalAtomicAdd(false) {
+        useBlockingSync(useBlockingSync), supportsHardwareFloatGlobalAtomicAdd(false), isIntelGPU(false) {
     if (!hasInitializedHip) {
         CHECK_RESULT2(hipInit(0), "Error initializing HIP");
         hasInitializedHip = true;
@@ -166,13 +167,17 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
     this->simdWidth = props.warpSize;
     this->sharedMemPerBlock = props.sharedMemPerBlock;
 
-    gpuArchitecture = props.gcnArchName;
+    // gpuArchitecture = props.gcnArchName;
+    gpuArchitecture = "";
     // HIP-TODO: find a good value here
     int numThreadBlocksPerComputeUnit = 6;
 
     // GPUs starting from CDNA1 and RDNA3 support atomic add for floats (global_atomic_add_f32),
     // which can be used in PME. Older GPUs use fixed point charge spreading instead.
-    this->supportsHardwareFloatGlobalAtomicAdd = true;
+    // Intel GPUs via chipStar: disable float atomicAdd for PME charge spreading
+    // to avoid NaN energy in large PME systems
+    this->isIntelGPU = (string(props.name).find("Intel") != string::npos);
+    this->supportsHardwareFloatGlobalAtomicAdd = !this->isIntelGPU;
     if (gpuArchitecture.find("gfx900") == 0 ||
         gpuArchitecture.find("gfx906") == 0 ||
         gpuArchitecture.find("gfx10") == 0) {
@@ -203,13 +208,15 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
     numAtomBlocks = (paddedNumAtoms+(TileSize-1))/TileSize;
     CHECK_RESULT(hipDeviceGetAttribute(&multiprocessors, hipDeviceAttributeMultiprocessorCount, device));
     // For RDNA GPUs hipDeviceAttributeMultiprocessorCount means WGP (work-group processors, two compute units), not CUs.
-    if (simdWidth == 32)
-        multiprocessors *= 2;
+    // if (simdWidth == 32)
+    //     multiprocessors *= 2;
     numThreadBlocks = numThreadBlocksPerComputeUnit*multiprocessors;
 
     compilationDefines["USE_HIP"] = "1";
-    if (simdWidth == 32)
-        compilationDefines["AMD_RDNA"] = "1";
+    if (isIntelGPU)
+        compilationDefines["USE_INT64_ATOMIC_ADD_WORKAROUND"] = "1";
+    // if (simdWidth == 32)
+        // compilationDefines["AMD_RDNA"] = "1";
     if (useDoublePrecision) {
         posq.initialize<double4>(*this, paddedNumAtoms, "posq");
         velm.initialize<double4>(*this, paddedNumAtoms, "velm");
