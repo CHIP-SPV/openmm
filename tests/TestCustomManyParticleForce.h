@@ -728,6 +728,7 @@ void testIllegalVariable() {
 
 void runPlatformTests();
 
+#ifndef CUSTOM_MANY_PARTICLE_MAIN_DEFINED
 int main(int argc, char* argv[]) {
     try {
         initializeTests(argc, argv);
@@ -758,3 +759,4 @@ int main(int argc, char* argv[]) {
     cout << "Done" << endl;
     return 0;
 }
+#endif
