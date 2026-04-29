@@ -437,7 +437,11 @@ DEVICE float computePScaleFactor(uint2 covalent, unsigned int polarizationGroup,
  * Compute nonbonded interactions.
  */
 KERNEL void computeFixedField(
+#ifdef USE_FLOAT_INDUCED_FIELD
+        GLOBAL int* RESTRICT fieldBuffers, GLOBAL int* RESTRICT fieldPolarBuffers, GLOBAL const real4* RESTRICT posq,
+#else
         GLOBAL mm_ulong* RESTRICT fieldBuffers, GLOBAL mm_ulong* RESTRICT fieldPolarBuffers, GLOBAL const real4* RESTRICT posq,
+#endif
         GLOBAL const uint2* RESTRICT covalentFlags, GLOBAL const unsigned int* RESTRICT polarizationGroupFlags, GLOBAL const int2* RESTRICT exclusionTiles,
         unsigned int startTileIndex, unsigned int numTileIndices,
 #ifdef USE_CUTOFF
@@ -557,6 +561,17 @@ KERNEL void computeFixedField(
 #endif
                 }
                 tj = (tj + 1) & (TILE_SIZE - 1);
+#ifdef __HIP_PLATFORM_SPIRV__
+                // chipStar on Intel GPUs may compile a 32-wide HIP warp as two SIMD16
+                // hardware threads that do NOT execute in lockstep. This loop does
+                // read-modify-writes to localData[tbx+tj] where consecutive iterations
+                // touch the SAME index (tj rotates by 1), so iter j's writes must be
+                // visible before iter j+1's reads. Without this barrier, races in
+                // shared-memory accumulation cause non-deterministic induced fields.
+                // Native HIP (AMD) executes a 32/64-wide wavefront in lockstep, so the
+                // barrier is unnecessary there.
+                SYNC_WARPS;
+#endif
             }
             SYNC_WARPS;
         }
@@ -564,12 +579,21 @@ KERNEL void computeFixedField(
         // Write results.
         
         unsigned int offset = x*TILE_SIZE + tgx;
+#ifdef USE_FLOAT_INDUCED_FIELD
+        atomicAddI32((int*)&fieldBuffers[offset], (int)rintf((float)data.field.x * AMOEBA_FIELD_SCALE_F));
+        atomicAddI32((int*)&fieldBuffers[offset+PADDED_NUM_ATOMS], (int)rintf((float)data.field.y * AMOEBA_FIELD_SCALE_F));
+        atomicAddI32((int*)&fieldBuffers[offset+2*PADDED_NUM_ATOMS], (int)rintf((float)data.field.z * AMOEBA_FIELD_SCALE_F));
+        atomicAddI32((int*)&fieldPolarBuffers[offset], (int)rintf((float)data.fieldPolar.x * AMOEBA_FIELD_SCALE_F));
+        atomicAddI32((int*)&fieldPolarBuffers[offset+PADDED_NUM_ATOMS], (int)rintf((float)data.fieldPolar.y * AMOEBA_FIELD_SCALE_F));
+        atomicAddI32((int*)&fieldPolarBuffers[offset+2*PADDED_NUM_ATOMS], (int)rintf((float)data.fieldPolar.z * AMOEBA_FIELD_SCALE_F));
+#else
         ATOMIC_ADD(&fieldBuffers[offset], (mm_ulong) realToFixedPoint(data.field.x));
         ATOMIC_ADD(&fieldBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.field.y));
         ATOMIC_ADD(&fieldBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.field.z));
         ATOMIC_ADD(&fieldPolarBuffers[offset], (mm_ulong) realToFixedPoint(data.fieldPolar.x));
         ATOMIC_ADD(&fieldPolarBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.fieldPolar.y));
         ATOMIC_ADD(&fieldPolarBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.fieldPolar.z));
+#endif
 #ifdef USE_GK
         ATOMIC_ADD(&gkFieldBuffers[offset], (mm_ulong) realToFixedPoint(data.gkField.x));
         ATOMIC_ADD(&gkFieldBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.gkField.y));
@@ -577,12 +601,21 @@ KERNEL void computeFixedField(
 #endif
         if (x != y) {
             offset = y*TILE_SIZE + tgx;
+#ifdef USE_FLOAT_INDUCED_FIELD
+            atomicAddI32(&fieldBuffers[offset], (int)rintf((float)localData[LOCAL_ID].field.x * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldBuffers[offset+PADDED_NUM_ATOMS], (int)rintf((float)localData[LOCAL_ID].field.y * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldBuffers[offset+2*PADDED_NUM_ATOMS], (int)rintf((float)localData[LOCAL_ID].field.z * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldPolarBuffers[offset], (int)rintf((float)localData[LOCAL_ID].fieldPolar.x * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldPolarBuffers[offset+PADDED_NUM_ATOMS], (int)rintf((float)localData[LOCAL_ID].fieldPolar.y * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldPolarBuffers[offset+2*PADDED_NUM_ATOMS], (int)rintf((float)localData[LOCAL_ID].fieldPolar.z * AMOEBA_FIELD_SCALE_F));
+#else
             ATOMIC_ADD(&fieldBuffers[offset], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].field.x));
             ATOMIC_ADD(&fieldBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].field.y));
             ATOMIC_ADD(&fieldBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].field.z));
             ATOMIC_ADD(&fieldPolarBuffers[offset], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].fieldPolar.x));
             ATOMIC_ADD(&fieldPolarBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].fieldPolar.y));
             ATOMIC_ADD(&fieldPolarBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].fieldPolar.z));
+#endif
 #ifdef USE_GK
             ATOMIC_ADD(&gkFieldBuffers[offset], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].gkField.x));
             ATOMIC_ADD(&gkFieldBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].gkField.y));
@@ -706,12 +739,21 @@ KERNEL void computeFixedField(
             // Write results.
 
             unsigned int offset = x*TILE_SIZE + tgx;
+#ifdef USE_FLOAT_INDUCED_FIELD
+            atomicAddI32(&fieldBuffers[offset], (int)rintf((float)data.field.x * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldBuffers[offset+PADDED_NUM_ATOMS], (int)rintf((float)data.field.y * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldBuffers[offset+2*PADDED_NUM_ATOMS], (int)rintf((float)data.field.z * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldPolarBuffers[offset], (int)rintf((float)data.fieldPolar.x * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldPolarBuffers[offset+PADDED_NUM_ATOMS], (int)rintf((float)data.fieldPolar.y * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldPolarBuffers[offset+2*PADDED_NUM_ATOMS], (int)rintf((float)data.fieldPolar.z * AMOEBA_FIELD_SCALE_F));
+#else
             ATOMIC_ADD(&fieldBuffers[offset], (mm_ulong) realToFixedPoint(data.field.x));
             ATOMIC_ADD(&fieldBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.field.y));
             ATOMIC_ADD(&fieldBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.field.z));
             ATOMIC_ADD(&fieldPolarBuffers[offset], (mm_ulong) realToFixedPoint(data.fieldPolar.x));
             ATOMIC_ADD(&fieldPolarBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.fieldPolar.y));
             ATOMIC_ADD(&fieldPolarBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.fieldPolar.z));
+#endif
 #ifdef USE_GK
             ATOMIC_ADD(&gkFieldBuffers[offset], (mm_ulong) realToFixedPoint(data.gkField.x));
             ATOMIC_ADD(&gkFieldBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.gkField.y));
@@ -722,12 +764,21 @@ KERNEL void computeFixedField(
 #else
             offset = y*TILE_SIZE + tgx;
 #endif
+#ifdef USE_FLOAT_INDUCED_FIELD
+            atomicAddI32(&fieldBuffers[offset], (int)rintf((float)localData[LOCAL_ID].field.x * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldBuffers[offset+PADDED_NUM_ATOMS], (int)rintf((float)localData[LOCAL_ID].field.y * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldBuffers[offset+2*PADDED_NUM_ATOMS], (int)rintf((float)localData[LOCAL_ID].field.z * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldPolarBuffers[offset], (int)rintf((float)localData[LOCAL_ID].fieldPolar.x * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldPolarBuffers[offset+PADDED_NUM_ATOMS], (int)rintf((float)localData[LOCAL_ID].fieldPolar.y * AMOEBA_FIELD_SCALE_F));
+            atomicAddI32(&fieldPolarBuffers[offset+2*PADDED_NUM_ATOMS], (int)rintf((float)localData[LOCAL_ID].fieldPolar.z * AMOEBA_FIELD_SCALE_F));
+#else
             ATOMIC_ADD(&fieldBuffers[offset], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].field.x));
             ATOMIC_ADD(&fieldBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].field.y));
             ATOMIC_ADD(&fieldBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].field.z));
             ATOMIC_ADD(&fieldPolarBuffers[offset], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].fieldPolar.x));
             ATOMIC_ADD(&fieldPolarBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].fieldPolar.y));
             ATOMIC_ADD(&fieldPolarBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].fieldPolar.z));
+#endif
 #ifdef USE_GK
             ATOMIC_ADD(&gkFieldBuffers[offset], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].gkField.x));
             ATOMIC_ADD(&gkFieldBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].gkField.y));

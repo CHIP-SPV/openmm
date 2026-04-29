@@ -289,19 +289,37 @@ KERNEL void computeLabFrameMoments(GLOBAL real4* RESTRICT posq, GLOBAL int4* RES
     }
 }
 
-KERNEL void recordInducedDipoles(GLOBAL const mm_long* RESTRICT fieldBuffers, GLOBAL const mm_long* RESTRICT fieldPolarBuffers,
+KERNEL void recordInducedDipoles(
+#ifdef USE_FLOAT_INDUCED_FIELD
+        GLOBAL const int* RESTRICT fieldBuffers, GLOBAL const int* RESTRICT fieldPolarBuffers,
+#else
+        GLOBAL const mm_long* RESTRICT fieldBuffers, GLOBAL const mm_long* RESTRICT fieldPolarBuffers,
+#endif
 #ifdef USE_GK
-        GLOBAL const mm_long* RESTRICT gkFieldBuffers, GLOBAL real* RESTRICT inducedDipoleS, GLOBAL real* RESTRICT inducedDipolePolarS, 
+        GLOBAL const mm_long* RESTRICT gkFieldBuffers, GLOBAL real* RESTRICT inducedDipoleS, GLOBAL real* RESTRICT inducedDipolePolarS,
 #endif
         GLOBAL real* RESTRICT inducedDipole, GLOBAL real* RESTRICT inducedDipolePolar, GLOBAL const float* RESTRICT polarizability) {
     for (int atom = GLOBAL_ID; atom < NUM_ATOMS; atom += GLOBAL_SIZE) {
+#ifdef USE_FLOAT_INDUCED_FIELD
+        real scale = polarizability[atom] * AMOEBA_FIELD_SCALE_INV;
+#else
         real scale = polarizability[atom]/(real) 0x100000000;
+#endif
+#ifdef USE_FLOAT_INDUCED_FIELD
+        inducedDipole[3*atom] = scale*(real)fieldBuffers[atom];
+        inducedDipole[3*atom+1] = scale*(real)fieldBuffers[atom+PADDED_NUM_ATOMS];
+        inducedDipole[3*atom+2] = scale*(real)fieldBuffers[atom+PADDED_NUM_ATOMS*2];
+        inducedDipolePolar[3*atom] = scale*(real)fieldPolarBuffers[atom];
+        inducedDipolePolar[3*atom+1] = scale*(real)fieldPolarBuffers[atom+PADDED_NUM_ATOMS];
+        inducedDipolePolar[3*atom+2] = scale*(real)fieldPolarBuffers[atom+PADDED_NUM_ATOMS*2];
+#else
         inducedDipole[3*atom] = scale*fieldBuffers[atom];
         inducedDipole[3*atom+1] = scale*fieldBuffers[atom+PADDED_NUM_ATOMS];
         inducedDipole[3*atom+2] = scale*fieldBuffers[atom+PADDED_NUM_ATOMS*2];
         inducedDipolePolar[3*atom] = scale*fieldPolarBuffers[atom];
         inducedDipolePolar[3*atom+1] = scale*fieldPolarBuffers[atom+PADDED_NUM_ATOMS];
         inducedDipolePolar[3*atom+2] = scale*fieldPolarBuffers[atom+PADDED_NUM_ATOMS*2];
+#endif
 #ifdef USE_GK
         inducedDipoleS[3*atom] = scale*(fieldBuffers[atom]+gkFieldBuffers[atom]);
         inducedDipoleS[3*atom+1] = scale*(fieldBuffers[atom+PADDED_NUM_ATOMS]+gkFieldBuffers[atom+PADDED_NUM_ATOMS]);

@@ -469,6 +469,17 @@ KERNEL void computeElectrostatics(
                     computeOneInteraction(&data, &localData[tbx+tj], true, d, p, m, 1, &energy);
                 }
                 tj = (tj + 1) & (TILE_SIZE - 1);
+#ifdef __HIP_PLATFORM_SPIRV__
+                // chipStar on Intel GPUs may compile a 32-wide HIP warp as two SIMD16
+                // hardware threads that do NOT execute in lockstep. computeOneInteraction
+                // does a read-modify-write on localData[tbx+tj].force/torque (via atom2),
+                // and consecutive iterations touch the SAME index (tj rotates by 1), so
+                // iter j's writes must be visible before iter j+1's reads. Without this
+                // barrier, races produce non-deterministic force/torque accumulation.
+                // Native HIP (AMD) runs a wavefront in lockstep, so the barrier is
+                // unnecessary there.
+                SYNC_WARPS;
+#endif
             }
             data.force *= -ENERGY_SCALE_FACTOR;
             data.torque *= ENERGY_SCALE_FACTOR;

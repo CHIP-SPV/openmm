@@ -108,6 +108,47 @@ inline DEVICE void zeroAtomDataLocal(LOCAL_ARG AtomData* data) {
     #endif
 #endif
 
+#ifdef USE_FLOAT_INDUCED_FIELD
+// Intel Arc: use int32 fixed-point atomicAdd (32-bit, not affected by IGC int64 4x bug).
+// Field buffer declared as int* for clean SPIR-V OpAtomicIAdd (no pointer reinterpret cast).
+// sizeof(int)==sizeof(float)==4; the buffer is still 4 bytes per element.
+inline DEVICE void saveAtomData(int index, AtomData data, GLOBAL int* RESTRICT field, GLOBAL int* RESTRICT fieldPolar
+#ifdef EXTRAPOLATED_POLARIZATION
+        , GLOBAL mm_ulong* RESTRICT fieldGradient, GLOBAL mm_ulong* RESTRICT fieldGradientPolar
+#endif
+#ifdef USE_GK
+        , GLOBAL mm_ulong* RESTRICT fieldS, GLOBAL mm_ulong* RESTRICT fieldPolarS
+    #ifdef EXTRAPOLATED_POLARIZATION
+        , GLOBAL mm_ulong* RESTRICT fieldGradientS, GLOBAL mm_ulong* RESTRICT fieldGradientPolarS
+    #endif
+#endif
+        ) {
+    atomicAddI32(&field[index], (int)rintf((float)data.field.x * AMOEBA_FIELD_SCALE_F));
+    atomicAddI32(&field[index+PADDED_NUM_ATOMS], (int)rintf((float)data.field.y * AMOEBA_FIELD_SCALE_F));
+    atomicAddI32(&field[index+2*PADDED_NUM_ATOMS], (int)rintf((float)data.field.z * AMOEBA_FIELD_SCALE_F));
+    atomicAddI32(&fieldPolar[index], (int)rintf((float)data.fieldPolar.x * AMOEBA_FIELD_SCALE_F));
+    atomicAddI32(&fieldPolar[index+PADDED_NUM_ATOMS], (int)rintf((float)data.fieldPolar.y * AMOEBA_FIELD_SCALE_F));
+    atomicAddI32(&fieldPolar[index+2*PADDED_NUM_ATOMS], (int)rintf((float)data.fieldPolar.z * AMOEBA_FIELD_SCALE_F));
+#ifdef USE_GK
+    ATOMIC_ADD(&fieldS[index], (mm_ulong) realToFixedPoint(data.fieldS.x));
+    ATOMIC_ADD(&fieldS[index+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.fieldS.y));
+    ATOMIC_ADD(&fieldS[index+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.fieldS.z));
+    ATOMIC_ADD(&fieldPolarS[index], (mm_ulong) realToFixedPoint(data.fieldPolarS.x));
+    ATOMIC_ADD(&fieldPolarS[index+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.fieldPolarS.y));
+    ATOMIC_ADD(&fieldPolarS[index+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.fieldPolarS.z));
+#endif
+#ifdef EXTRAPOLATED_POLARIZATION
+    for (int i = 0; i < 6; i++) {
+        ATOMIC_ADD(&fieldGradient[6*index+i], (mm_ulong) realToFixedPoint(data.fieldGradient[i]));
+        ATOMIC_ADD(&fieldGradientPolar[6*index+i], (mm_ulong) realToFixedPoint(data.fieldGradientPolar[i]));
+#ifdef USE_GK
+        ATOMIC_ADD(&fieldGradientS[6*index+i], (mm_ulong) realToFixedPoint(data.fieldGradientS[i]));
+        ATOMIC_ADD(&fieldGradientPolarS[6*index+i], (mm_ulong) realToFixedPoint(data.fieldGradientPolarS[i]));
+#endif
+    }
+#endif
+}
+#else
 inline DEVICE void saveAtomData(int index, AtomData data, GLOBAL mm_ulong* RESTRICT field, GLOBAL mm_ulong* RESTRICT fieldPolar
 #ifdef EXTRAPOLATED_POLARIZATION
         , GLOBAL mm_ulong* RESTRICT fieldGradient, GLOBAL mm_ulong* RESTRICT fieldGradientPolar
@@ -144,9 +185,10 @@ inline DEVICE void saveAtomData(int index, AtomData data, GLOBAL mm_ulong* RESTR
     }
 #endif
 }
+#endif
 
 #ifdef USE_EWALD
-DEVICE void computeOneInteraction(AtomData* atom1, LOCAL_ARG AtomData* atom2, real3 deltaR, bool isSelfInteraction) {
+DEVICE __attribute__((noinline)) void computeOneInteraction(AtomData* atom1, LOCAL_ARG AtomData* atom2, real3 deltaR, bool isSelfInteraction) {
     if (isSelfInteraction)
         return;
     real scale1, scale2, scale3;
@@ -258,7 +300,7 @@ DEVICE void computeOneInteraction(AtomData* atom1, LOCAL_ARG AtomData* atom2, re
 #endif
 }
 #elif defined USE_GK
-DEVICE void computeOneInteraction(AtomData* atom1, LOCAL_ARG AtomData* atom2, real3 deltaR, bool isSelfInteraction) {
+DEVICE __attribute__((noinline)) void computeOneInteraction(AtomData* atom1, LOCAL_ARG AtomData* atom2, real3 deltaR, bool isSelfInteraction) {
     real r2 = dot(deltaR, deltaR);
     real r = SQRT(r2);
     if (!isSelfInteraction) {
@@ -314,7 +356,7 @@ DEVICE void computeOneInteraction(AtomData* atom1, LOCAL_ARG AtomData* atom2, re
     atom2->fieldPolarS += atom1->inducedDipolePolarS.x*gux+atom1->inducedDipolePolarS.y*guy+atom1->inducedDipolePolarS.z*guz;
 }
 #else
-DEVICE void computeOneInteraction(AtomData* atom1, LOCAL_ARG AtomData* atom2, real3 deltaR, bool isSelfInteraction) {
+DEVICE __attribute__((noinline)) void computeOneInteraction(AtomData* atom1, LOCAL_ARG AtomData* atom2, real3 deltaR, bool isSelfInteraction) {
     if (isSelfInteraction)
         return;
     real rI = RSQRT(dot(deltaR, deltaR));
@@ -385,7 +427,12 @@ DEVICE void computeOneInteraction(AtomData* atom1, LOCAL_ARG AtomData* atom2, re
  * Compute the mutual induced field.
  */
 KERNEL void computeInducedField(
-        GLOBAL mm_ulong* RESTRICT field, GLOBAL mm_ulong* RESTRICT fieldPolar, GLOBAL const real4* RESTRICT posq, GLOBAL const int2* RESTRICT exclusionTiles, 
+#ifdef USE_FLOAT_INDUCED_FIELD
+        GLOBAL int* RESTRICT field, GLOBAL int* RESTRICT fieldPolar,
+#else
+        GLOBAL mm_ulong* RESTRICT field, GLOBAL mm_ulong* RESTRICT fieldPolar,
+#endif
+        GLOBAL const real4* RESTRICT posq, GLOBAL const int2* RESTRICT exclusionTiles,
         GLOBAL const real* RESTRICT inducedDipole, GLOBAL const real* RESTRICT inducedDipolePolar, unsigned int startTileIndex, unsigned int numTileIndices,
 #ifdef USE_CUTOFF
         GLOBAL const int* RESTRICT tiles, GLOBAL const unsigned int* RESTRICT interactionCount, real4 periodicBoxSize, real4 invPeriodicBoxSize,
@@ -442,8 +489,10 @@ KERNEL void computeInducedField(
                 APPLY_PERIODIC_TO_DELTA(delta)
 #endif
                 int atom2 = y*TILE_SIZE+j;
-                if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS)
-                    computeOneInteraction(&data, &localData[tbx+j], delta, atom1 == atom2);
+                if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
+                    AtomData atom2Copy = localData[tbx+j];
+                    computeOneInteraction(&data, &atom2Copy, delta, atom1 == atom2);
+                }
             }
             SYNC_WARPS;
         }
@@ -467,6 +516,16 @@ KERNEL void computeInducedField(
                 if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS)
                     computeOneInteraction(&data, &localData[tbx+tj], delta, false);
                 tj = (tj + 1) & (TILE_SIZE - 1);
+#ifdef __HIP_PLATFORM_SPIRV__
+                // chipStar on Intel GPUs may compile a 32-wide HIP warp as two SIMD16
+                // hardware threads that do NOT execute in lockstep. computeOneInteraction
+                // does a read-modify-write on localData[tbx+tj].field (via atom2->field),
+                // and consecutive iterations touch the SAME index (tj rotates by 1), so
+                // iter j's writes must be visible before iter j+1's reads. Without this
+                // barrier, races produce non-deterministic induced fields/dipoles. Native
+                // HIP (AMD) runs a wavefront in lockstep, so the barrier is unnecessary.
+                SYNC_WARPS;
+#endif
             }
             SYNC_WARPS;
         }
@@ -591,9 +650,19 @@ KERNEL void computeInducedField(
     }
 }
 
-KERNEL void recordInducedDipolesForDIIS(GLOBAL const mm_long* RESTRICT fixedField, GLOBAL const mm_long* RESTRICT fixedFieldPolar,
+KERNEL void recordInducedDipolesForDIIS(
+#ifdef USE_FLOAT_INDUCED_FIELD
+        GLOBAL const int* RESTRICT fixedField, GLOBAL const int* RESTRICT fixedFieldPolar,
+#else
+        GLOBAL const mm_long* RESTRICT fixedField, GLOBAL const mm_long* RESTRICT fixedFieldPolar,
+#endif
         GLOBAL const float* RESTRICT polarizability, GLOBAL float2* RESTRICT errors, GLOBAL real* RESTRICT prevErrors, GLOBAL real* RESTRICT matrix,
-        GLOBAL const mm_long* RESTRICT fixedFieldS, GLOBAL const mm_long* RESTRICT inducedField, GLOBAL const mm_long* RESTRICT inducedFieldPolar,
+        GLOBAL const mm_long* RESTRICT fixedFieldS,
+#ifdef USE_FLOAT_INDUCED_FIELD
+        GLOBAL const int* RESTRICT inducedField, GLOBAL const int* RESTRICT inducedFieldPolar,
+#else
+        GLOBAL const mm_long* RESTRICT inducedField, GLOBAL const mm_long* RESTRICT inducedFieldPolar,
+#endif
         GLOBAL const real* RESTRICT inducedDipole, GLOBAL const real* RESTRICT inducedDipolePolar,
         GLOBAL real* RESTRICT prevDipoles, GLOBAL real* RESTRICT prevDipolesPolar, int iteration, int isGK) {
     LOCAL real2 buffer[64];
@@ -621,10 +690,20 @@ KERNEL void recordInducedDipolesForDIIS(GLOBAL const mm_long* RESTRICT fixedFiel
 
         real3 oldDipole = make_real3(inducedDipole[3*atom], inducedDipole[3*atom+1], inducedDipole[3*atom+2]);
         real3 oldDipolePolar = make_real3(inducedDipolePolar[3*atom], inducedDipolePolar[3*atom+1], inducedDipolePolar[3*atom+2]);
+#ifdef USE_FLOAT_INDUCED_FIELD
+        real3 fixed = make_real3((real)fixedField[atom], (real)fixedField[atom+PADDED_NUM_ATOMS], (real)fixedField[atom+2*PADDED_NUM_ATOMS]) * AMOEBA_FIELD_SCALE_INV;
+        real3 fixedPolar = make_real3((real)fixedFieldPolar[atom], (real)fixedFieldPolar[atom+PADDED_NUM_ATOMS], (real)fixedFieldPolar[atom+2*PADDED_NUM_ATOMS]) * AMOEBA_FIELD_SCALE_INV;
+#else
         real3 fixed = make_real3(fixedField[atom], fixedField[atom+PADDED_NUM_ATOMS], fixedField[atom+2*PADDED_NUM_ATOMS])*fieldScale;
         real3 fixedPolar = make_real3(fixedFieldPolar[atom], fixedFieldPolar[atom+PADDED_NUM_ATOMS], fixedFieldPolar[atom+2*PADDED_NUM_ATOMS])*fieldScale;
+#endif
+#ifdef USE_FLOAT_INDUCED_FIELD
+        real3 induced = make_real3((real)inducedField[atom], (real)inducedField[atom+PADDED_NUM_ATOMS], (real)inducedField[atom+2*PADDED_NUM_ATOMS]) * AMOEBA_FIELD_SCALE_INV;
+        real3 inducedPolar = make_real3((real)inducedFieldPolar[atom], (real)inducedFieldPolar[atom+PADDED_NUM_ATOMS], (real)inducedFieldPolar[atom+2*PADDED_NUM_ATOMS]) * AMOEBA_FIELD_SCALE_INV;
+#else
         real3 induced = make_real3(inducedField[atom], inducedField[atom+PADDED_NUM_ATOMS], inducedField[atom+2*PADDED_NUM_ATOMS])*fieldScale;
         real3 inducedPolar = make_real3(inducedFieldPolar[atom], inducedFieldPolar[atom+PADDED_NUM_ATOMS], inducedFieldPolar[atom+2*PADDED_NUM_ATOMS])*fieldScale;
+#endif
         real3 fixedS = make_real3(0);
         if (isGK)
             fixedS = make_real3(fixedFieldS[atom], fixedFieldS[atom+PADDED_NUM_ATOMS], fixedFieldS[atom+2*PADDED_NUM_ATOMS])*fieldScale;
@@ -697,124 +776,104 @@ KERNEL void computeDIISMatrix(GLOBAL real* RESTRICT prevErrors, int iteration, G
     }
 }
 
-KERNEL void solveDIISMatrix(int iteration, GLOBAL const real* RESTRICT matrix, GLOBAL float* RESTRICT coefficients) {
-    LOCAL real b[MAX_PREV_DIIS_DIPOLES+1][MAX_PREV_DIIS_DIPOLES+1];
-    LOCAL real piv[MAX_PREV_DIIS_DIPOLES+1];
-    LOCAL real x[MAX_PREV_DIIS_DIPOLES+1];
+DEVICE static void solveDIISLU(int rank, GLOBAL const real* RESTRICT matrix, real mean,
+                               GLOBAL float* RESTRICT coefficients,
+                               GLOBAL real* RESTRICT b, GLOBAL real* RESTRICT piv, GLOBAL real* RESTRICT x) {
+#define BRANK (MAX_PREV_DIIS_DIPOLES+1)
+    int numPrev = rank-1;
 
-    // On the first iteration we don't need to do any calculation.
-    
+    for (int i = 0; i < rank; i++) {
+        b[i*BRANK+0] = -1;
+        piv[i] = i;
+    }
+    for (int i = 0; i < numPrev; i++)
+        for (int j = 0; j < numPrev; j++)
+            b[(i+1)*BRANK+(j+1)] = matrix[i*MAX_PREV_DIIS_DIPOLES+j];
+    b[0*BRANK+0] = 0;
+    for (int i = 1; i < rank; i++)
+        b[0*BRANK+i] = -mean;
+
+    for (int j = 0; j < rank; j++) {
+        for (int i = 0; i < rank; i++) {
+            int kmax = min(i, j);
+            real s = 0;
+            for (int k = 0; k < kmax; k++)
+                s += b[i*BRANK+k] * b[k*BRANK+j];
+            b[i*BRANK+j] -= s;
+        }
+        int p = j;
+        for (int i = j+1; i < rank; i++)
+            if (fabs(b[i*BRANK+j]) > fabs(b[p*BRANK+j]))
+                p = i;
+        if (p != j) {
+            for (int k = 0; k < rank; k++) {
+                real t = b[p*BRANK+k];
+                b[p*BRANK+k] = b[j*BRANK+k];
+                b[j*BRANK+k] = t;
+            }
+            real tmp = piv[p]; piv[p] = piv[j]; piv[j] = tmp;
+        }
+        if ((j < rank) && (b[j*BRANK+j] != 0))
+            for (int i = j+1; i < rank; i++)
+                b[i*BRANK+j] /= b[j*BRANK+j];
+    }
+
+    for (int i = 0; i < rank; i++) {
+        if (b[i*BRANK+i] == 0) {
+            for (int j = 0; j < rank-1; j++)
+                coefficients[j] = 0;
+            coefficients[rank-1] = 1;
+            return;
+        }
+    }
+
+    for (int i = 0; i < rank; i++)
+        x[i] = ((int)piv[i] == 0 ? (real)-1 : (real)0);
+    for (int k = 0; k < rank; k++)
+        for (int i = k+1; i < rank; i++)
+            x[i] -= x[k] * b[i*BRANK+k];
+    for (int k = rank-1; k >= 0; k--) {
+        x[k] /= b[k*BRANK+k];
+        for (int i = 0; i < k; i++)
+            x[i] -= x[k] * b[i*BRANK+k];
+    }
+
+    real lastCoeff = 1;
+    for (int i = 0; i < rank-1; i++) {
+        real c = x[i+1]*mean;
+        coefficients[i] = c;
+        lastCoeff -= c;
+    }
+    coefficients[rank-1] = lastCoeff;
+#undef BRANK
+}
+
+KERNEL void solveDIISMatrix(int iteration, GLOBAL const real* RESTRICT matrix, GLOBAL float* RESTRICT coefficients,
+                            GLOBAL real* RESTRICT scratch) {
     if (iteration == 0) {
         if (LOCAL_ID == 0)
             coefficients[0] = 1;
         return;
     }
-    
-    // Load the matrix.
-    
+    if (LOCAL_ID != 0)
+        return;
+
     int numPrev = min(iteration+1, MAX_PREV_DIIS_DIPOLES);
     int rank = numPrev+1;
-    for (int index = LOCAL_ID; index < numPrev*numPrev; index += LOCAL_SIZE) {
-        int i = index/numPrev;
-        int j = index-i*numPrev;
-        b[i+1][j+1] = matrix[i*MAX_PREV_DIIS_DIPOLES+j];
-    }
-    for (int i = LOCAL_ID; i < rank; i += LOCAL_SIZE) {
-        b[i][0] = -1;
-        piv[i] = i;
-    }
-    SYNC_THREADS;
-    
-    // Compute the mean absolute value of the values we just loaded.  We use that for preconditioning it,
-    // which is essential for doing the computation in single precision.
-    
-    if (LOCAL_ID == 0) {
-        real mean = 0;
-        for (int i = 0; i < numPrev; i++)
-            for (int j = 0; j < numPrev; j++)
-                mean += fabs(b[i+1][j+1]);
-        mean /= numPrev*numPrev;
-        b[0][0] = 0;
-        for (int i = 1; i < rank; i++)
-            b[0][i] = -mean;
 
-        // Compute the LU decomposition of the matrix.  This code is adapted from JAMA.
-    
-        int pivsign = 1;
-        for (int j = 0; j < rank; j++) {
-            // Apply previous transformations.
+    real mean = 0;
+    for (int i = 0; i < numPrev; i++)
+        for (int j = 0; j < numPrev; j++)
+            mean += fabs(matrix[i*MAX_PREV_DIIS_DIPOLES+j]);
+    mean /= numPrev*numPrev;
 
-            for (int i = 0; i < rank; i++) {
-                // Most of the time is spent in the following dot product.
-
-                int kmax = min(i, j);
-                real s = 0;
-                for (int k = 0; k < kmax; k++)
-                    s += b[i][k] * b[k][j];
-                b[i][j] -= s;
-            }
-
-            // Find pivot and exchange if necessary.
-
-            int p = j;
-            for (int i = j+1; i < rank; i++)
-                if (fabs(b[i][j]) > fabs(b[p][j]))
-                    p = i;
-            if (p != j) {
-                int k = 0;
-                for (k = 0; k < rank; k++) {
-                    real t = b[p][k];
-                    b[p][k] = b[j][k];
-                    b[j][k] = t;
-                }
-                k = piv[p];
-                piv[p] = piv[j];
-                piv[j] = k;
-                pivsign = -pivsign;
-            }
-
-            // Compute multipliers.
-
-            if ((j < rank) && (b[j][j] != 0))
-                for (int i = j+1; i < rank; i++)
-                    b[i][j] /= b[j][j];
-        }
-        for (int i = 0; i < rank; i++)
-            if (b[i][i] == 0) {
-                // The matrix is singular.
-                
-                for (int j = 0; j < rank-1; j++)
-                    coefficients[j] = 0;
-                coefficients[rank-1] = 1;
-                return;
-            }
-
-        // Solve b*Y = X(piv)
-        
-        for (int i = 0; i < rank; i++) 
-            x[i] = (piv[i] == 0 ? -1 : 0);
-        for (int k = 0; k < rank; k++)
-            for (int i = k+1; i < rank; i++)
-                x[i] -= x[k] * b[i][k];
-
-        // Solve U*X = Y;
-        
-        for (int k = rank-1; k >= 0; k--) {
-            x[k] /= b[k][k];
-            for (int i = 0; i < k; i++)
-                x[i] -= x[k] * b[i][k];
-        }
-        
-        // Record the coefficients.
-        
-        real lastCoeff = 1;
-        for (int i = 0; i < rank-1; i++) {
-            real c = x[i+1]*mean;
-            coefficients[i] = c;
-            lastCoeff -= c;
-        }
-        coefficients[rank-1] = lastCoeff;
-    }
+    // scratch layout: b[(N+1)^2] | piv[N+1] | x[N+1]  where N = MAX_PREV_DIIS_DIPOLES
+#define BRANK (MAX_PREV_DIIS_DIPOLES+1)
+    GLOBAL real* b   = scratch;
+    GLOBAL real* piv = scratch + BRANK*BRANK;
+    GLOBAL real* x   = scratch + BRANK*BRANK + BRANK;
+#undef BRANK
+    solveDIISLU(rank, matrix, mean, coefficients, b, piv, x);
 }
 
 KERNEL void updateInducedFieldByDIIS(GLOBAL real* RESTRICT inducedDipole, GLOBAL real* RESTRICT inducedDipolePolar, 

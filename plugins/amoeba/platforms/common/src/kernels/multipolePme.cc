@@ -277,13 +277,13 @@ KERNEL void gridSpreadFixedMultipoles(GLOBAL const real4* RESTRICT posq, GLOBAL 
     #ifdef USE_FIXED_POINT_CHARGE_SPREADING
                     ATOMIC_ADD(&pmeGrid[index], (mm_ulong) realToFixedPoint(add));
     #else
-                    ATOMIC_ADD(&pmeGrid[index], add);
+                    atomicAdd(&pmeGrid[index], (real) add);
     #endif
 #else
     #ifdef USE_FIXED_POINT_CHARGE_SPREADING
                     ATOMIC_ADD(&pmeGrid[2*index], (mm_ulong) realToFixedPoint(add));
     #else
-                    ATOMIC_ADD(&pmeGrid[index].x, add);
+                    atomicAdd(&pmeGrid[index].x, (real) add);
     #endif
 #endif
                 }
@@ -399,7 +399,7 @@ KERNEL void gridSpreadInducedDipoles(GLOBAL const real4* RESTRICT posq, GLOBAL c
     #ifdef USE_FIXED_POINT_CHARGE_SPREADING
                     ATOMIC_ADD(&pmeGrid[index], (mm_ulong) realToFixedPoint(add1));
     #else
-                    ATOMIC_ADD(&pmeGrid[index], add1);
+                    atomicAdd(&pmeGrid[index], (real) add1);
     #endif
 #else
                     real add2 = term02*v.x + term12*v.y;
@@ -407,8 +407,8 @@ KERNEL void gridSpreadInducedDipoles(GLOBAL const real4* RESTRICT posq, GLOBAL c
                     ATOMIC_ADD(&pmeGrid[2*index], (mm_ulong) realToFixedPoint(add1));
                     ATOMIC_ADD(&pmeGrid[2*index+1], (mm_ulong) realToFixedPoint(add2));
     #else
-                    ATOMIC_ADD(&pmeGrid[index].x, add1);
-                    ATOMIC_ADD(&pmeGrid[index].y, add2);
+                    atomicAdd(&pmeGrid[index].x, (real) add1);
+                    atomicAdd(&pmeGrid[index].y, (real) add2);
     #endif
 #endif
                 }
@@ -481,9 +481,17 @@ KERNEL void computeFixedPotentialFromGrid(
 #else
         GLOBAL const real2* RESTRICT pmeGrid,
 #endif
-        GLOBAL real* RESTRICT phi, GLOBAL mm_long* RESTRICT fieldBuffers,
+        GLOBAL real* RESTRICT phi,
+#ifdef USE_FLOAT_INDUCED_FIELD
+        GLOBAL int* RESTRICT fieldBuffers,
+#ifndef HIPPO
+        GLOBAL int* RESTRICT fieldPolarBuffers,
+#endif
+#else
+        GLOBAL mm_long* RESTRICT fieldBuffers,
 #ifndef HIPPO
         GLOBAL mm_long* RESTRICT fieldPolarBuffers,
+#endif
 #endif
         GLOBAL const real4* RESTRICT posq, GLOBAL const real* RESTRICT labDipole, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
         real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ) {
@@ -648,9 +656,15 @@ KERNEL void computeFixedPotentialFromGrid(
         phi[m+NUM_ATOMS*18] = tuv012;
         phi[m+NUM_ATOMS*19] = tuv111;
         real dipoleScale = (4/(real) 3)*(EWALD_ALPHA*EWALD_ALPHA*EWALD_ALPHA)/SQRT_PI;
+#ifdef USE_FLOAT_INDUCED_FIELD
+        int fieldx = (int)rintf((float)(dipoleScale*labDipole[m*3]-tuv100*fracToCart[0][0]-tuv010*fracToCart[0][1]-tuv001*fracToCart[0][2]) * AMOEBA_FIELD_SCALE_F);
+        int fieldy = (int)rintf((float)(dipoleScale*labDipole[m*3+1]-tuv100*fracToCart[1][0]-tuv010*fracToCart[1][1]-tuv001*fracToCart[1][2]) * AMOEBA_FIELD_SCALE_F);
+        int fieldz = (int)rintf((float)(dipoleScale*labDipole[m*3+2]-tuv100*fracToCart[2][0]-tuv010*fracToCart[2][1]-tuv001*fracToCart[2][2]) * AMOEBA_FIELD_SCALE_F);
+#else
         mm_long fieldx = realToFixedPoint(dipoleScale*labDipole[m*3]-tuv100*fracToCart[0][0]-tuv010*fracToCart[0][1]-tuv001*fracToCart[0][2]);
         mm_long fieldy = realToFixedPoint(dipoleScale*labDipole[m*3+1]-tuv100*fracToCart[1][0]-tuv010*fracToCart[1][1]-tuv001*fracToCart[1][2]);
         mm_long fieldz = realToFixedPoint(dipoleScale*labDipole[m*3+2]-tuv100*fracToCart[2][0]-tuv010*fracToCart[2][1]-tuv001*fracToCart[2][2]);
+#endif
         fieldBuffers[m] = fieldx;
         fieldBuffers[m+PADDED_NUM_ATOMS] = fieldy;
         fieldBuffers[m+2*PADDED_NUM_ATOMS] = fieldz;
@@ -1274,8 +1288,13 @@ KERNEL void calculateSelfEnergyAndTorque(GLOBAL mm_long* RESTRICT torqueBuffers,
     energyBuffer[GLOBAL_ID] += fterm*(cii + term*(dii/3+2*term*qii/5)) + alpha3*alpha3*c6ii/12;
 }
 #else
-KERNEL void recordInducedFieldDipoles(GLOBAL const real* RESTRICT phid, GLOBAL real* const RESTRICT phip, GLOBAL mm_long* RESTRICT inducedField,
-        GLOBAL mm_long* RESTRICT inducedFieldPolar, GLOBAL const real* RESTRICT inducedDipole, GLOBAL const real* RESTRICT inducedDipolePolar,
+KERNEL void recordInducedFieldDipoles(GLOBAL const real* RESTRICT phid, GLOBAL real* const RESTRICT phip,
+#ifdef USE_FLOAT_INDUCED_FIELD
+        GLOBAL int* RESTRICT inducedField, GLOBAL int* RESTRICT inducedFieldPolar,
+#else
+        GLOBAL mm_long* RESTRICT inducedField, GLOBAL mm_long* RESTRICT inducedFieldPolar,
+#endif
+        GLOBAL const real* RESTRICT inducedDipole, GLOBAL const real* RESTRICT inducedDipolePolar,
         real4 recipBoxVecX, real4 recipBoxVecY, real4 recipBoxVecZ
 #ifdef EXTRAPOLATED_POLARIZATION
         , GLOBAL mm_ulong* RESTRICT fieldGradient, GLOBAL mm_ulong* RESTRICT fieldGradientPolar
@@ -1296,12 +1315,22 @@ KERNEL void recordInducedFieldDipoles(GLOBAL const real* RESTRICT phid, GLOBAL r
     SYNC_THREADS;
     real selfDipoleScale = (4/(real) 3)*(EWALD_ALPHA*EWALD_ALPHA*EWALD_ALPHA)/SQRT_PI;
     for (int i = GLOBAL_ID; i < NUM_ATOMS; i += GLOBAL_SIZE) {
+#ifdef USE_FLOAT_INDUCED_FIELD
+        // int32 fixed-point: buffer declared as int*, subtract scaled integer value directly.
+        inducedField[i] -= (int)rintf((float)(phid[i+NUM_ATOMS]*fracToCart[0][0] + phid[i+NUM_ATOMS*2]*fracToCart[0][1] + phid[i+NUM_ATOMS*3]*fracToCart[0][2] - selfDipoleScale*inducedDipole[3*i]) * AMOEBA_FIELD_SCALE_F);
+        inducedField[i+PADDED_NUM_ATOMS] -= (int)rintf((float)(phid[i+NUM_ATOMS]*fracToCart[1][0] + phid[i+NUM_ATOMS*2]*fracToCart[1][1] + phid[i+NUM_ATOMS*3]*fracToCart[1][2] - selfDipoleScale*inducedDipole[3*i+1]) * AMOEBA_FIELD_SCALE_F);
+        inducedField[i+PADDED_NUM_ATOMS*2] -= (int)rintf((float)(phid[i+NUM_ATOMS]*fracToCart[2][0] + phid[i+NUM_ATOMS*2]*fracToCart[2][1] + phid[i+NUM_ATOMS*3]*fracToCart[2][2] - selfDipoleScale*inducedDipole[3*i+2]) * AMOEBA_FIELD_SCALE_F);
+        inducedFieldPolar[i] -= (int)rintf((float)(phip[i+NUM_ATOMS]*fracToCart[0][0] + phip[i+NUM_ATOMS*2]*fracToCart[0][1] + phip[i+NUM_ATOMS*3]*fracToCart[0][2] - selfDipoleScale*inducedDipolePolar[3*i]) * AMOEBA_FIELD_SCALE_F);
+        inducedFieldPolar[i+PADDED_NUM_ATOMS] -= (int)rintf((float)(phip[i+NUM_ATOMS]*fracToCart[1][0] + phip[i+NUM_ATOMS*2]*fracToCart[1][1] + phip[i+NUM_ATOMS*3]*fracToCart[1][2] - selfDipoleScale*inducedDipolePolar[3*i+1]) * AMOEBA_FIELD_SCALE_F);
+        inducedFieldPolar[i+PADDED_NUM_ATOMS*2] -= (int)rintf((float)(phip[i+NUM_ATOMS]*fracToCart[2][0] + phip[i+NUM_ATOMS*2]*fracToCart[2][1] + phip[i+NUM_ATOMS*3]*fracToCart[2][2] - selfDipoleScale*inducedDipolePolar[3*i+2]) * AMOEBA_FIELD_SCALE_F);
+#else
         inducedField[i] -= realToFixedPoint(phid[i+NUM_ATOMS]*fracToCart[0][0] + phid[i+NUM_ATOMS*2]*fracToCart[0][1] + phid[i+NUM_ATOMS*3]*fracToCart[0][2] - selfDipoleScale*inducedDipole[3*i]);
         inducedField[i+PADDED_NUM_ATOMS] -= realToFixedPoint(phid[i+NUM_ATOMS]*fracToCart[1][0] + phid[i+NUM_ATOMS*2]*fracToCart[1][1] + phid[i+NUM_ATOMS*3]*fracToCart[1][2] - selfDipoleScale*inducedDipole[3*i+1]);
         inducedField[i+PADDED_NUM_ATOMS*2] -= realToFixedPoint(phid[i+NUM_ATOMS]*fracToCart[2][0] + phid[i+NUM_ATOMS*2]*fracToCart[2][1] + phid[i+NUM_ATOMS*3]*fracToCart[2][2] - selfDipoleScale*inducedDipole[3*i+2]);
         inducedFieldPolar[i] -= realToFixedPoint(phip[i+NUM_ATOMS]*fracToCart[0][0] + phip[i+NUM_ATOMS*2]*fracToCart[0][1] + phip[i+NUM_ATOMS*3]*fracToCart[0][2] - selfDipoleScale*inducedDipolePolar[3*i]);
         inducedFieldPolar[i+PADDED_NUM_ATOMS] -= realToFixedPoint(phip[i+NUM_ATOMS]*fracToCart[1][0] + phip[i+NUM_ATOMS*2]*fracToCart[1][1] + phip[i+NUM_ATOMS*3]*fracToCart[1][2] - selfDipoleScale*inducedDipolePolar[3*i+1]);
         inducedFieldPolar[i+PADDED_NUM_ATOMS*2] -= realToFixedPoint(phip[i+NUM_ATOMS]*fracToCart[2][0] + phip[i+NUM_ATOMS*2]*fracToCart[2][1] + phip[i+NUM_ATOMS*3]*fracToCart[2][2] - selfDipoleScale*inducedDipolePolar[3*i+2]);
+#endif
 #ifdef EXTRAPOLATED_POLARIZATION
         // Compute and store the field gradients for later use.
 
