@@ -93,6 +93,16 @@ __global__ void reduceEnergy(const mixed* __restrict__ energyBuffer, mixed* __re
 }
 
 /**
+ * Accumulate a float energy buffer into a double energy buffer.
+ * Used in mixed precision to avoid fp64 in the nonbonded kernel: the
+ * nonbonded kernel writes float energy values to a float scratch buffer,
+ * and this kernel adds them to the main double energyBuffer.
+ */
+__global__ void accumulateRealEnergy(const float* __restrict__ src, double* __restrict__ dst, int n) {
+    for (int i = blockDim.x*blockIdx.x+threadIdx.x; i < n; i += blockDim.x*gridDim.x)
+        dst[i] += (double)src[i];
+}
+/**
  * Record the atomic charges into the posq array.
  */
 __global__ void setCharges(real* __restrict__ charges, real4* __restrict__ posq, int* __restrict__ atomOrder, int numAtoms) {

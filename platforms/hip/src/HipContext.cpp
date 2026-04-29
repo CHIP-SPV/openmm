@@ -261,6 +261,7 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
     clearFiveBuffersKernel = getKernel(utilities, "clearFiveBuffers");
     clearSixBuffersKernel = getKernel(utilities, "clearSixBuffers");
     reduceEnergyKernel = getKernel(utilities, "reduceEnergy");
+    accumulateRealEnergyKernel = getKernel(utilities, "accumulateRealEnergy");
     setChargesKernel = getKernel(utilities, "setCharges");
 
     // Set defines based on the requested precision.

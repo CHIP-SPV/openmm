@@ -250,6 +250,12 @@ public:
         return energyBuffer;
     }
     /**
+     * Get the kernel that accumulates a float energy buffer into the double energy buffer (mixed precision).
+     */
+    hipFunction_t getAccumulateRealEnergyKernel() {
+        return accumulateRealEnergyKernel;
+    }
+    /**
      * Get the array which contains the buffer in which derivatives of the energy with respect to parameters are computed.
      */
     HipArray& getEnergyParamDerivBuffer() {
@@ -631,6 +637,7 @@ private:
     hipFunction_t clearFiveBuffersKernel;
     hipFunction_t clearSixBuffersKernel;
     hipFunction_t reduceEnergyKernel;
+    hipFunction_t accumulateRealEnergyKernel;
     hipFunction_t setChargesKernel;
     void* pinnedBuffer;
     HipArray posq;
