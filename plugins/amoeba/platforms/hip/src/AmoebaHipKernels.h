@@ -63,7 +63,11 @@ public:
      * Get whether charge spreading should be done in fixed point.
      */
     bool useFixedPointChargeSpreading() const {
-        return cc.getUseDoublePrecision() || !dynamic_cast<HipContext&>(cc).getSupportsHardwareFloatGlobalAtomicAdd();
+        return cc.getUseDoublePrecision() || !dynamic_cast<const HipContext&>(cc).getSupportsHardwareFloatGlobalAtomicAdd();
+    }
+    bool useFloatInducedFieldAccumulation() const {
+        bool isIntelArc = !dynamic_cast<const HipContext&>(cc).getSupportsHardwareFloatGlobalAtomicAdd();
+        return isIntelArc && !cc.getUseDoublePrecision();
     }
 private:
     HipContext& cu;
@@ -94,7 +98,7 @@ public:
      * Get whether charge spreading should be done in fixed point.
      */
     bool useFixedPointChargeSpreading() const {
-        return cc.getUseDoublePrecision() || !dynamic_cast<HipContext&>(cc).getSupportsHardwareFloatGlobalAtomicAdd();
+        return cc.getUseDoublePrecision() || !dynamic_cast<const HipContext&>(cc).getSupportsHardwareFloatGlobalAtomicAdd();
     }
     /**
      * Sort the atom grid indices.

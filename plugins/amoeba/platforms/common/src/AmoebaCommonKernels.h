@@ -160,6 +160,11 @@ public:
      * Get whether charge spreading should be done in fixed point.
      */
     virtual bool useFixedPointChargeSpreading() const = 0;
+    /**
+     * Get whether the induced field accumulation buffers should use float (instead of mm_long
+     * fixed-point). Used on platforms where 64-bit integer atomicAdd is unreliable.
+     */
+    virtual bool useFloatInducedFieldAccumulation() const { return false; }
 protected:
     class ForceInfo;
     void initializeScaleFactors();
@@ -203,6 +208,7 @@ protected:
     ComputeArray prevErrors;
     ComputeArray diisMatrix;
     ComputeArray diisCoefficients;
+    ComputeArray diisScratch;
     ComputeArray extrapolatedDipole;
     ComputeArray extrapolatedDipolePolar;
     ComputeArray extrapolatedDipoleGk;
@@ -235,6 +241,8 @@ protected:
     ComputeKernel recordDIISDipolesKernel, buildMatrixKernel, solveMatrixKernel;
     ComputeKernel initExtrapolatedKernel, iterateExtrapolatedKernel, computeExtrapolatedKernel, addExtrapolatedGradientKernel;
     ComputeKernel pmeSpreadFixedMultipolesKernel, pmeSpreadInducedDipolesKernel, pmeFinishSpreadChargeKernel, pmeConvolutionKernel;
+    ComputeKernel pmeSpreadFixedMultipolesFloatKernel;
+    ComputeKernel pmeSpreadInducedDipolesFloatKernel;
     ComputeKernel pmeFixedPotentialKernel, pmeInducedPotentialKernel, pmeFixedForceKernel, pmeInducedForceKernel, pmeRecordInducedFieldDipolesKernel;
     ComputeKernel pmeTransformMultipolesKernel, pmeTransformPotentialKernel;
     ComputeEvent syncEvent;
@@ -319,7 +327,7 @@ private:
     ComputeArray inducedFieldPolar;
     ComputeArray inducedDipoleS;
     ComputeArray inducedDipolePolarS;
-    ComputeKernel computeBornSumKernel, reduceBornSumKernel, surfaceAreaKernel, gkForceKernel, chainRuleKernel, ediffKernel;
+    ComputeKernel computeBornSumKernel, reduceBornSumKernel, surfaceAreaKernel, gkForceKernel, gkTorqueAKernel, gkTorqueBKernel, gkBornForceKernel, chainRuleKernel, ediffKernel;
 };
 
 /**

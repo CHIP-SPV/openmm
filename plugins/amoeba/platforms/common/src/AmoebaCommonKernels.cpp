@@ -288,8 +288,11 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
     sphericalQuadrupoles.initialize(cc, 5*paddedNumAtoms, elementSize, "sphericalQuadrupoles");
     fracDipoles.initialize(cc, 3*paddedNumAtoms, elementSize, "fracDipoles");
     fracQuadrupoles.initialize(cc, 6*paddedNumAtoms, elementSize, "fracQuadrupoles");
-    field.initialize(cc, 3*paddedNumAtoms, sizeof(long long), "field");
-    fieldPolar.initialize(cc, 3*paddedNumAtoms, sizeof(long long), "fieldPolar");
+    {
+        size_t fieldElemSize = useFloatInducedFieldAccumulation() ? sizeof(float) : sizeof(long long);
+        field.initialize(cc, 3*paddedNumAtoms, fieldElemSize, "field");
+        fieldPolar.initialize(cc, 3*paddedNumAtoms, fieldElemSize, "fieldPolar");
+    }
     torque.initialize(cc, 3*paddedNumAtoms, sizeof(long long), "torque");
     inducedDipole.initialize(cc, 3*paddedNumAtoms, elementSize, "inducedDipole");
     inducedDipolePolar.initialize(cc, 3*paddedNumAtoms, elementSize, "inducedDipolePolar");
@@ -300,6 +303,8 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
         prevErrors.initialize(cc, 3*numMultipoles*MaxPrevDIISDipoles, elementSize, "prevErrors");
         diisMatrix.initialize(cc, MaxPrevDIISDipoles*MaxPrevDIISDipoles, elementSize, "diisMatrix");
         diisCoefficients.initialize(cc, MaxPrevDIISDipoles+1, sizeof(float), "diisCoefficients");
+        // Scratch buffer for solveDIISMatrix: b[(N+1)^2] + piv[N+1] + x[N+1]
+        diisScratch.initialize(cc, (MaxPrevDIISDipoles+1)*(MaxPrevDIISDipoles+1) + 2*(MaxPrevDIISDipoles+1), elementSize, "diisScratch");
         syncEvent = cc.createEvent();
         hasCreatedEvent = true;
     }
@@ -372,8 +377,9 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
     else
         maxInducedIterations = 0;
     if (polarizationType != AmoebaMultipoleForce::Direct) {
-        inducedField.initialize(cc, 3*paddedNumAtoms, sizeof(long long), "inducedField");
-        inducedFieldPolar.initialize(cc, 3*paddedNumAtoms, sizeof(long long), "inducedFieldPolar");
+        size_t inducedFieldElemSize = useFloatInducedFieldAccumulation() ? sizeof(float) : sizeof(long long);
+        inducedField.initialize(cc, 3*paddedNumAtoms, inducedFieldElemSize, "inducedField");
+        inducedFieldPolar.initialize(cc, 3*paddedNumAtoms, inducedFieldElemSize, "inducedFieldPolar");
     }
     usePME = (force.getNonbondedMethod() == AmoebaMultipoleForce::PME);
     
@@ -399,6 +405,13 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
     defines["PADDED_NUM_ATOMS"] = cc.intToString(cc.getPaddedNumAtoms());
     defines["NUM_BLOCKS"] = cc.intToString(cc.getNumAtomBlocks());
     defines["ENERGY_SCALE_FACTOR"] = cc.doubleToString(ONE_4PI_EPS0/innerDielectric);
+    if (useFloatInducedFieldAccumulation()) {
+        defines["USE_FLOAT_INDUCED_FIELD"] = "1";
+        // int32 fixed-point scale for deterministic field accumulation on Intel Arc.
+        // 2^20 = 1048576; max safe accumulated field ~2047 in field units before overflow.
+        defines["AMOEBA_FIELD_SCALE_F"] = "1048576.0f";
+        defines["AMOEBA_FIELD_SCALE_INV"] = "(1.0f/1048576.0f)";
+    }
     if (polarizationType == AmoebaMultipoleForce::Direct)
         defines["DIRECT_POLARIZATION"] = "";
     else if (polarizationType == AmoebaMultipoleForce::Mutual)
@@ -512,7 +525,7 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
     computePotentialKernel->addArg(inducedDipole);
     for (int i = 0; i < 8; i++)
         computePotentialKernel->addArg();
-    defines["THREAD_BLOCK_SIZE"] = cc.intToString(fixedFieldThreads);
+    defines["THREAD_BLOCK_SIZE"] = cc.intToString(useFloatInducedFieldAccumulation() ? cc.TileSize : fixedFieldThreads);
     program = cc.compileProgram(CommonAmoebaKernelSources::multipoleFixedField, defines);
     computeFixedFieldKernel = program->createKernel("computeFixedField");
     computeFixedFieldKernel->addArg(field);
@@ -539,8 +552,10 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
     computeFixedFieldKernel->addArg(labQuadrupoles);
     computeFixedFieldKernel->addArg(dampingAndThole);
     if (polarizationType != AmoebaMultipoleForce::Direct) {
-        defines["THREAD_BLOCK_SIZE"] = cc.intToString(inducedFieldThreads);
+        defines["THREAD_BLOCK_SIZE"] = cc.intToString(useFloatInducedFieldAccumulation() ? cc.TileSize : inducedFieldThreads);
         defines["MAX_PREV_DIIS_DIPOLES"] = cc.intToString(MaxPrevDIISDipoles);
+        if (useFloatInducedFieldAccumulation())
+            defines["USE_FLOAT_INDUCED_FIELD"] = "1";
         program = cc.compileProgram(CommonAmoebaKernelSources::multipoleInducedField, defines);
         computeInducedFieldKernel = program->createKernel("computeInducedField");
         computeInducedFieldKernel->addArg(inducedField);
@@ -595,6 +610,7 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
             solveMatrixKernel->addArg();
             solveMatrixKernel->addArg(diisMatrix);
             solveMatrixKernel->addArg(diisCoefficients);
+            solveMatrixKernel->addArg(diisScratch);
         }
         if (polarizationType == AmoebaMultipoleForce::Extrapolated) {
             initExtrapolatedKernel = program->createKernel("initExtrapolatedDipoles");
@@ -740,6 +756,11 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
             pmeDefines["EXTRAPOLATED_POLARIZATION"] = "";
         if (useFixedPointChargeSpreading())
             pmeDefines["USE_FIXED_POINT_CHARGE_SPREADING"] = "";
+        if (useFloatInducedFieldAccumulation()) {
+            pmeDefines["USE_FLOAT_INDUCED_FIELD"] = "1";
+            pmeDefines["AMOEBA_FIELD_SCALE_F"] = "1048576.0f";
+            pmeDefines["AMOEBA_FIELD_SCALE_INV"] = "(1.0f/1048576.0f)";
+        }
         program = cc.compileProgram(CommonAmoebaKernelSources::multipolePme, pmeDefines);
         pmeTransformMultipolesKernel = program->createKernel("transformMultipolesToFractionalCoordinates");
         pmeTransformMultipolesKernel->addArg(labDipoles);
@@ -777,6 +798,25 @@ void CommonCalcAmoebaMultipoleForceKernel::initialize(const System& system, cons
             pmeFinishSpreadChargeKernel = program->createKernel("finishSpreadCharge");
             pmeFinishSpreadChargeKernel->addArg(pmeGridLong);
             pmeFinishSpreadChargeKernel->addArg(pmeGrid1);
+        }
+        if (useFloatInducedFieldAccumulation() && useFixedPointChargeSpreading()) {
+            map<string, string> floatPmeDefines = pmeDefines;
+            floatPmeDefines.erase("USE_FIXED_POINT_CHARGE_SPREADING");
+            ComputeProgram floatPmeProgram = cc.compileProgram(CommonAmoebaKernelSources::multipolePme, floatPmeDefines);
+            pmeSpreadFixedMultipolesFloatKernel = floatPmeProgram->createKernel("gridSpreadFixedMultipoles");
+            pmeSpreadFixedMultipolesFloatKernel->addArg(cc.getPosq());
+            pmeSpreadFixedMultipolesFloatKernel->addArg(fracDipoles);
+            pmeSpreadFixedMultipolesFloatKernel->addArg(fracQuadrupoles);
+            pmeSpreadFixedMultipolesFloatKernel->addArg(pmeGrid1);
+            for (int i = 0; i < 6; i++)
+                pmeSpreadFixedMultipolesFloatKernel->addArg();
+            pmeSpreadInducedDipolesFloatKernel = floatPmeProgram->createKernel("gridSpreadInducedDipoles");
+            pmeSpreadInducedDipolesFloatKernel->addArg(cc.getPosq());
+            pmeSpreadInducedDipolesFloatKernel->addArg(inducedDipole);
+            pmeSpreadInducedDipolesFloatKernel->addArg(inducedDipolePolar);
+            pmeSpreadInducedDipolesFloatKernel->addArg(pmeGrid1);
+            for (int i = 0; i < 6; i++)
+                pmeSpreadInducedDipolesFloatKernel->addArg();
         }
         pmeConvolutionKernel = program->createKernel("reciprocalConvolution");
         pmeConvolutionKernel->addArg(pmeGrid2);
@@ -1079,9 +1119,9 @@ double CommonCalcAmoebaMultipoleForceKernel::execute(ContextImpl& context, bool 
             gkKernel->computeBornRadii(torque, labDipoles, labQuadrupoles, inducedDipole, inducedDipolePolar, dampingAndThole, covalentFlags, polarizationGroupFlags);
         computeFixedFieldKernel->execute(numForceThreadBlocks*fixedFieldThreads, fixedFieldThreads);
         recordInducedDipolesKernel->execute(cc.getNumAtoms());
-        
+
         // Iterate until the dipoles converge.
-        
+
         if (polarizationType == AmoebaMultipoleForce::Extrapolated)
             computeExtrapolatedDipoles();
         for (int i = 0; i < maxInducedIterations; i++) {
@@ -1090,9 +1130,9 @@ double CommonCalcAmoebaMultipoleForceKernel::execute(ContextImpl& context, bool 
             if (converged)
                 break;
         }
-        
+
         // Compute electrostatic force.
-        
+
         electrostaticsKernel->execute(numForceThreadBlocks*electrostaticsThreads, electrostaticsThreads);
         if (gkKernel != NULL)
             gkKernel->finishComputation();
@@ -1141,8 +1181,16 @@ double CommonCalcAmoebaMultipoleForceKernel::execute(ContextImpl& context, bool 
                 pmeTransformPotentialKernel->setArg(2+i, recipBoxVectorsFloat[i]);
                 pmeSpreadFixedMultipolesKernel->setArg(4+i, boxVectors[i]);
                 pmeSpreadFixedMultipolesKernel->setArg(7+i, recipBoxVectorsFloat[i]);
+                if (pmeSpreadFixedMultipolesFloatKernel != NULL) {
+                    pmeSpreadFixedMultipolesFloatKernel->setArg(4+i, boxVectors[i]);
+                    pmeSpreadFixedMultipolesFloatKernel->setArg(7+i, recipBoxVectorsFloat[i]);
+                }
                 pmeSpreadInducedDipolesKernel->setArg(4+i, boxVectors[i]);
                 pmeSpreadInducedDipolesKernel->setArg(7+i, recipBoxVectorsFloat[i]);
+                if (pmeSpreadInducedDipolesFloatKernel != NULL) {
+                    pmeSpreadInducedDipolesFloatKernel->setArg(4+i, boxVectors[i]);
+                    pmeSpreadInducedDipolesFloatKernel->setArg(7+i, recipBoxVectorsFloat[i]);
+                }
                 pmeConvolutionKernel->setArg(5+i, recipBoxVectorsFloat[i]);
                 pmeFixedPotentialKernel->setArg(6+i, boxVectors[i]);
                 pmeFixedPotentialKernel->setArg(9+i, recipBoxVectorsFloat[i]);
@@ -1156,12 +1204,18 @@ double CommonCalcAmoebaMultipoleForceKernel::execute(ContextImpl& context, bool 
         }
 
         // Reciprocal space calculation.
-        
+
         unsigned int maxTiles = nb.getInteractingTiles().getSize();
         pmeTransformMultipolesKernel->execute(cc.getNumAtoms());
-        pmeSpreadFixedMultipolesKernel->execute(cc.getNumAtoms());
-        if (useFixedPointChargeSpreading())
-            pmeFinishSpreadChargeKernel->execute(pmeGrid1.getSize());
+        if (pmeSpreadFixedMultipolesFloatKernel != NULL) {
+            cc.clearBuffer(pmeGrid1);
+            pmeSpreadFixedMultipolesFloatKernel->execute(1, 1);
+        }
+        else {
+            pmeSpreadFixedMultipolesKernel->execute(cc.getNumAtoms());
+            if (useFixedPointChargeSpreading())
+                pmeFinishSpreadChargeKernel->execute(pmeGrid1.getSize());
+        }
         computeFFT(true);
         pmeConvolutionKernel->execute(gridSizeX*gridSizeY*gridSizeZ, 256);
         computeFFT(false);
@@ -1179,20 +1233,26 @@ double CommonCalcAmoebaMultipoleForceKernel::execute(ContextImpl& context, bool 
 
         // Reciprocal space calculation for the induced dipoles.
 
-        if (useFixedPointChargeSpreading())
-            cc.clearBuffer(pmeGridLong);
-        else
+        if (pmeSpreadInducedDipolesFloatKernel != NULL) {
             cc.clearBuffer(pmeGrid1);
-        pmeSpreadInducedDipolesKernel->execute(cc.getNumAtoms());
-        if (useFixedPointChargeSpreading())
+            pmeSpreadInducedDipolesFloatKernel->execute(1, 1);
+        }
+        else if (useFixedPointChargeSpreading()) {
+            cc.clearBuffer(pmeGridLong);
+            pmeSpreadInducedDipolesKernel->execute(cc.getNumAtoms());
             pmeFinishSpreadChargeKernel->execute(pmeGrid1.getSize());
+        }
+        else {
+            cc.clearBuffer(pmeGrid1);
+            pmeSpreadInducedDipolesKernel->execute(cc.getNumAtoms());
+        }
         computeFFT(true);
         pmeConvolutionKernel->execute(gridSizeX*gridSizeY*gridSizeZ, 256);
         computeFFT(false);
         pmeInducedPotentialKernel->execute(cc.getNumAtoms());
         
         // Iterate until the dipoles converge.
-        
+
         if (polarizationType == AmoebaMultipoleForce::Extrapolated)
             computeExtrapolatedDipoles();
         for (int i = 0; i < maxInducedIterations; i++) {
@@ -1201,9 +1261,9 @@ double CommonCalcAmoebaMultipoleForceKernel::execute(ContextImpl& context, bool 
             if (converged)
                 break;
         }
-        
+
         // Compute electrostatic force.
-        
+
         setPeriodicBoxArgs(cc, electrostaticsKernel, 11);
         electrostaticsKernel->setArg(16, maxTiles);
         electrostaticsKernel->execute(numForceThreadBlocks*electrostaticsThreads, electrostaticsThreads);
@@ -1255,13 +1315,19 @@ void CommonCalcAmoebaMultipoleForceKernel::computeInducedField() {
     }
     computeInducedFieldKernel->execute(numForceThreadBlocks*inducedFieldThreads, inducedFieldThreads);
     if (pmeGrid1.isInitialized()) {
-        if (useFixedPointChargeSpreading())
-            cc.clearBuffer(pmeGridLong);
-        else
+        if (pmeSpreadInducedDipolesFloatKernel != NULL) {
             cc.clearBuffer(pmeGrid1);
-        pmeSpreadInducedDipolesKernel->execute(cc.getNumAtoms());
-        if (useFixedPointChargeSpreading())
+            pmeSpreadInducedDipolesFloatKernel->execute(1, 1);
+        }
+        else if (useFixedPointChargeSpreading()) {
+            cc.clearBuffer(pmeGridLong);
+            pmeSpreadInducedDipolesKernel->execute(cc.getNumAtoms());
             pmeFinishSpreadChargeKernel->execute(pmeGrid1.getSize());
+        }
+        else {
+            cc.clearBuffer(pmeGrid1);
+            pmeSpreadInducedDipolesKernel->execute(cc.getNumAtoms());
+        }
         computeFFT(true);
         pmeConvolutionKernel->execute(gridSizeX*gridSizeY*gridSizeZ, 256);
         computeFFT(false);
@@ -1302,31 +1368,32 @@ bool CommonCalcAmoebaMultipoleForceKernel::iterateDipolesByDIIS(int iteration) {
     recordDIISDipolesKernel->setArg(14, 0);
     recordDIISDipolesKernel->execute(cc.getNumThreadBlocks()*64, 64);
     mm_float2* errors = (mm_float2*) cc.getPinnedBuffer();
-    inducedDipoleErrors.download(errors, false);
     syncEvent->enqueue();
-    
+
     // Build the DIIS matrix.
-    
+
     int numPrev = (iteration+1 < MaxPrevDIISDipoles ? iteration+1 : MaxPrevDIISDipoles);
     int threadBlocks = min(numPrev, cc.getNumThreadBlocks());
     int blockSize = min(512, buildMatrixKernel->getMaxBlockSize());
     buildMatrixKernel->setArg(1, iteration);
     buildMatrixKernel->execute(threadBlocks*blockSize, blockSize);
-    
+
     // Solve the matrix.
 
     solveMatrixKernel->setArg(0, iteration);
     solveMatrixKernel->execute(32, 32);
-    
+
     // Determine whether the iteration has converged.
-    
+
     syncEvent->wait();
+    inducedDipoleErrors.download(errors, true);
     double total1 = 0.0, total2 = 0.0;
     for (int j = 0; j < inducedDipoleErrors.getSize(); j++) {
         total1 += errors[j].x;
         total2 += errors[j].y;
     }
-    if (48.033324*sqrt(max(total1, total2)/cc.getNumAtoms()) < inducedEpsilon)
+    double diisErr = 48.033324*sqrt(max(total1, total2)/cc.getNumAtoms());
+    if (diisErr < inducedEpsilon)
         return true;
     
     // Compute the dipoles.
@@ -1894,9 +1961,13 @@ void CommonCalcAmoebaGeneralizedKirkwoodForceKernel::computeBornRadii(ComputeArr
         forceSource << CommonAmoebaKernelSources::gkEDiffPairForce;
         forceSource << "#undef T3\n";
         forceSource << "#define B1\n";
+        forceSource << CommonAmoebaKernelSources::gkPairForce1;
+        forceSource << CommonAmoebaKernelSources::gkPairForce2;
+        forceSource << "#undef B1\n";
         forceSource << "#define B2\n";
         forceSource << CommonAmoebaKernelSources::gkPairForce1;
         forceSource << CommonAmoebaKernelSources::gkPairForce2;
+        forceSource << "#undef B2\n";
         ComputeProgram program = cc.compileProgram(forceSource.str(), defines);
         computeBornSumKernel = program->createKernel("computeBornSum");
         computeBornSumKernel->addArg(bornSum);
@@ -1912,7 +1983,6 @@ void CommonCalcAmoebaGeneralizedKirkwoodForceKernel::computeBornRadii(ComputeArr
         reduceBornSumKernel->addArg(bornRadii);
         gkForceKernel = program->createKernel("computeGKForces");
         gkForceKernel->addArg(cc.getLongForceBuffer());
-        gkForceKernel->addArg(torque);
         gkForceKernel->addArg(cc.getEnergyBuffer());
         gkForceKernel->addArg(cc.getPosq());
         gkForceKernel->addArg();
@@ -1922,7 +1992,36 @@ void CommonCalcAmoebaGeneralizedKirkwoodForceKernel::computeBornRadii(ComputeArr
         gkForceKernel->addArg(inducedDipoleS);
         gkForceKernel->addArg(inducedDipolePolarS);
         gkForceKernel->addArg(bornRadii);
-        gkForceKernel->addArg(bornForce);
+        gkTorqueAKernel = program->createKernel("computeGKTorquesA");
+        gkTorqueAKernel->addArg(torque);
+        gkTorqueAKernel->addArg(cc.getPosq());
+        gkTorqueAKernel->addArg();
+        gkTorqueAKernel->addArg();
+        gkTorqueAKernel->addArg(labDipoles);
+        gkTorqueAKernel->addArg(labQuadrupoles);
+        gkTorqueAKernel->addArg(inducedDipoleS);
+        gkTorqueAKernel->addArg(inducedDipolePolarS);
+        gkTorqueAKernel->addArg(bornRadii);
+        gkTorqueBKernel = program->createKernel("computeGKTorquesB");
+        gkTorqueBKernel->addArg(torque);
+        gkTorqueBKernel->addArg(cc.getPosq());
+        gkTorqueBKernel->addArg();
+        gkTorqueBKernel->addArg();
+        gkTorqueBKernel->addArg(labDipoles);
+        gkTorqueBKernel->addArg(labQuadrupoles);
+        gkTorqueBKernel->addArg(inducedDipoleS);
+        gkTorqueBKernel->addArg(inducedDipolePolarS);
+        gkTorqueBKernel->addArg(bornRadii);
+        gkBornForceKernel = program->createKernel("computeGKBornForces");
+        gkBornForceKernel->addArg(cc.getPosq());
+        gkBornForceKernel->addArg();
+        gkBornForceKernel->addArg();
+        gkBornForceKernel->addArg(labDipoles);
+        gkBornForceKernel->addArg(labQuadrupoles);
+        gkBornForceKernel->addArg(inducedDipoleS);
+        gkBornForceKernel->addArg(inducedDipolePolarS);
+        gkBornForceKernel->addArg(bornRadii);
+        gkBornForceKernel->addArg(bornForce);
         chainRuleKernel = program->createKernel("computeChainRuleForce");
         chainRuleKernel->addArg(cc.getLongForceBuffer());
         chainRuleKernel->addArg(cc.getPosq());
@@ -1972,11 +2071,20 @@ void CommonCalcAmoebaGeneralizedKirkwoodForceKernel::finishComputation() {
     int numTileIndices = nb.getNumTiles();
     int numForceThreadBlocks = nb.getNumForceThreadBlocks();
     
-    // Compute the GK force.
-    
-    gkForceKernel->setArg(4, startTileIndex);
-    gkForceKernel->setArg(5, numTileIndices);
+    // Compute the GK force (split into three kernels: forces, torques, Born forces).
+
+    gkForceKernel->setArg(3, startTileIndex);
+    gkForceKernel->setArg(4, numTileIndices);
     gkForceKernel->execute(numForceThreadBlocks*gkForceThreads, gkForceThreads);
+    gkTorqueAKernel->setArg(2, startTileIndex);
+    gkTorqueAKernel->setArg(3, numTileIndices);
+    gkTorqueAKernel->execute(numForceThreadBlocks*gkForceThreads, gkForceThreads);
+    gkTorqueBKernel->setArg(2, startTileIndex);
+    gkTorqueBKernel->setArg(3, numTileIndices);
+    gkTorqueBKernel->execute(numForceThreadBlocks*gkForceThreads, gkForceThreads);
+    gkBornForceKernel->setArg(1, startTileIndex);
+    gkBornForceKernel->setArg(2, numTileIndices);
+    gkBornForceKernel->execute(numForceThreadBlocks*gkForceThreads, gkForceThreads);
 
     // Compute the surface area force.
     
