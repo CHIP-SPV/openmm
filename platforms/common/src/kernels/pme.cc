@@ -221,7 +221,7 @@ KERNEL void gridEvaluateEnergy(GLOBAL real2* RESTRICT pmeGrid, GLOBAL mixed* RES
         real eterm = (fac1*erfcterm*m3 + expterm*(fac2 + fac3*m2)) * denom;
 #else
         real denom = m2*bx*by*bz;
-        real eterm = recipScaleFactor*EXP(-RECIP_EXP_FACTOR*m2)/denom;
+        real eterm = (denom != (real) 0 && m2 > (real) 0) ? recipScaleFactor*EXP(-RECIP_EXP_FACTOR*m2)/denom : (real) 0;
 #endif
         if (kz >= (GRID_SIZE_Z/2+1)) {
             kx = ((kx == 0) ? kx : GRID_SIZE_X-kx);
