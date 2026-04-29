@@ -95,9 +95,10 @@ private:
     ComputeArray forces;
     ComputeArray positions;
     ComputeArray velocities;
+    ComputeArray fftImag;
     ComputeArray contractedForces;
     ComputeArray contractedPositions;
-    ComputeKernel pileKernel, stepKernel, velocitiesKernel, copyToContextKernel, copyFromContextKernel, translateKernel;
+    ComputeKernel pileKernel, stepKernel, stepKernel2, velocitiesKernel, copyToContextKernel, copyFromContextKernel, translateKernel;
     std::map<int, ComputeKernel> positionContractionKernels;
     std::map<int, ComputeKernel> forceContractionKernels;
 };

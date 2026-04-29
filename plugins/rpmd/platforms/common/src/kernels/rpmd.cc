@@ -1,16 +1,19 @@
-DEVICE mixed3 multiplyComplexRealPart(mixed2 c1, mixed3 c2r, mixed3 c2i) {
+// Mark these helpers always_inline so IGC does not generate stack calls for them,
+// which would consume GPU private memory and potentially cause CL_OUT_OF_RESOURCES
+// on devices with limited scratch memory (e.g. Intel Arc A770).
+DEVICE __attribute__((always_inline)) mixed3 multiplyComplexRealPart(mixed2 c1, mixed3 c2r, mixed3 c2i) {
     return c1.x*c2r-c1.y*c2i;
 }
 
-DEVICE mixed3 multiplyComplexImagPart(mixed2 c1, mixed3 c2r, mixed3 c2i) {
+DEVICE __attribute__((always_inline)) mixed3 multiplyComplexImagPart(mixed2 c1, mixed3 c2r, mixed3 c2i) {
     return c1.x*c2i+c1.y*c2r;
 }
 
-DEVICE mixed3 multiplyComplexRealPartConj(mixed2 c1, mixed3 c2r, mixed3 c2i) {
+DEVICE __attribute__((always_inline)) mixed3 multiplyComplexRealPartConj(mixed2 c1, mixed3 c2r, mixed3 c2i) {
     return c1.x*c2r+c1.y*c2i;
 }
 
-DEVICE mixed3 multiplyComplexImagPartConj(mixed2 c1, mixed3 c2r, mixed3 c2i) {
+DEVICE __attribute__((always_inline)) mixed3 multiplyComplexImagPartConj(mixed2 c1, mixed3 c2r, mixed3 c2i) {
     return c1.x*c2i-c1.y*c2r;
 }
 
@@ -83,7 +86,7 @@ KERNEL void applyPileThermostat(GLOBAL mixed4* velm, GLOBAL float4* random, unsi
 /**
  * Advance the positions and velocities.
  */
-KERNEL void integrateStep(GLOBAL mixed4* posq, GLOBAL mixed4* velm, GLOBAL mm_long* force, mixed dt, mixed kT) {
+KERNEL void integrateStep(GLOBAL mixed4* posq, GLOBAL mixed4* velm, GLOBAL mm_long* force, GLOBAL mixed4* fftImag, mixed dt, mixed kT) {
     const int numBlocks = (GLOBAL_SIZE)/NUM_COPIES;
     const int blockStart = NUM_COPIES*(LOCAL_ID/NUM_COPIES);
     const int indexInBlock = LOCAL_ID-blockStart;
@@ -150,9 +153,58 @@ KERNEL void integrateStep(GLOBAL mixed4* posq, GLOBAL mixed4* velm, GLOBAL mm_lo
             vimag[indexInBlock] = vprimeimag;
         }
         SYNC_THREADS;
-        
+
+        // Store frequency-domain data to global memory for the backward FFT kernel.
+        // Skip virtual sites (w == 0) so their positions are not corrupted.
+        if (particleVelm.w != 0) {
+            posq[particle+indexInBlock*PADDED_NUM_ATOMS] = make_mixed4(qreal[indexInBlock].x, qreal[indexInBlock].y, qreal[indexInBlock].z, particlePosq.w);
+            velm[particle+indexInBlock*PADDED_NUM_ATOMS] = make_mixed4(vreal[indexInBlock].x, vreal[indexInBlock].y, vreal[indexInBlock].z, particleVelm.w);
+            fftImag[particle+indexInBlock*PADDED_NUM_ATOMS] = make_mixed4(qimag[indexInBlock].x, qimag[indexInBlock].y, qimag[indexInBlock].z, 0.0f);
+            fftImag[particle+(NUM_COPIES+indexInBlock)*PADDED_NUM_ATOMS] = make_mixed4(vimag[indexInBlock].x, vimag[indexInBlock].y, vimag[indexInBlock].z, 0.0f);
+        }
+    }
+}
+
+/**
+ * Apply the inverse FFT and write physical positions/velocities back.
+ * This is the second half of the integrateStep operation, split out so
+ * that each kernel contains only two inline FFTs (instead of four),
+ * keeping the kernel body small enough for IGC SIMD32 compilation.
+ */
+KERNEL void integrateStep2(GLOBAL mixed4* posq, GLOBAL mixed4* velm, GLOBAL mixed4* fftImag) {
+    const int numBlocks = (GLOBAL_SIZE)/NUM_COPIES;
+    const int blockStart = NUM_COPIES*(LOCAL_ID/NUM_COPIES);
+    const int indexInBlock = LOCAL_ID-blockStart;
+    LOCAL mixed3 q[2*THREAD_BLOCK_SIZE];
+    LOCAL mixed3 v[2*THREAD_BLOCK_SIZE];
+    LOCAL mixed3 temp[2*THREAD_BLOCK_SIZE];
+    LOCAL mixed2 w[NUM_COPIES];
+
+    LOCAL_ARG mixed3* qreal = &q[blockStart];
+    LOCAL_ARG mixed3* qimag = &q[blockStart+LOCAL_SIZE];
+    LOCAL_ARG mixed3* vreal = &v[blockStart];
+    LOCAL_ARG mixed3* vimag = &v[blockStart+LOCAL_SIZE];
+    if (LOCAL_ID < NUM_COPIES)
+        w[indexInBlock] = make_mixed2(cos(-indexInBlock*2*M_PI/NUM_COPIES), sin(-indexInBlock*2*M_PI/NUM_COPIES));
+    SYNC_THREADS;
+    for (int particle = (GLOBAL_ID)/NUM_COPIES; particle < NUM_ATOMS; particle += numBlocks) {
+        mixed4 particlePosq = posq[particle+indexInBlock*PADDED_NUM_ATOMS];
+        mixed4 particleVelm = velm[particle+indexInBlock*PADDED_NUM_ATOMS];
+
+        // For virtual sites (w == 0), integrateStep left posq/velm unchanged (physical
+        // coordinates). Load them here but do not write back, preserving the original values.
+        qreal[indexInBlock] = make_mixed3(particlePosq.x, particlePosq.y, particlePosq.z);
+        qimag[indexInBlock] = make_mixed3(fftImag[particle+indexInBlock*PADDED_NUM_ATOMS].x,
+                                           fftImag[particle+indexInBlock*PADDED_NUM_ATOMS].y,
+                                           fftImag[particle+indexInBlock*PADDED_NUM_ATOMS].z);
+        vreal[indexInBlock] = make_mixed3(particleVelm.x, particleVelm.y, particleVelm.z);
+        vimag[indexInBlock] = make_mixed3(fftImag[particle+(NUM_COPIES+indexInBlock)*PADDED_NUM_ATOMS].x,
+                                           fftImag[particle+(NUM_COPIES+indexInBlock)*PADDED_NUM_ATOMS].y,
+                                           fftImag[particle+(NUM_COPIES+indexInBlock)*PADDED_NUM_ATOMS].z);
+        SYNC_THREADS;
+
         // Inverse FFT.
-        
+
         FFT_Q_BACKWARD
         FFT_V_BACKWARD
         if (particleVelm.w != 0) {

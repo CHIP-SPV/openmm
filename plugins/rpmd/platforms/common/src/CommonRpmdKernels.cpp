@@ -140,6 +140,7 @@ void CommonIntegrateRPMDStepKernel::initialize(const System& system, const RPMDI
     defines["HBAR"] = cc.doubleToString(1.054571628e-34*AVOGADRO/(1000*1e-12), true);
     defines["SCALE"] = cc.doubleToString(1.0/sqrt((double) numCopies), true);
     defines["M_PI"] = cc.doubleToString(M_PI, true);
+    fftImag.initialize(cc, 2*numCopies*paddedParticles, elementSize*4, "rpmdFftImag");
     map<string, string> replacements;
     replacements["FFT_Q_FORWARD"] = createFFT(numCopies, "q", true);
     replacements["FFT_Q_BACKWARD"] = createFFT(numCopies, "q", false);
@@ -148,6 +149,7 @@ void CommonIntegrateRPMDStepKernel::initialize(const System& system, const RPMDI
     ComputeProgram program = cc.compileProgram(cc.replaceStrings(CommonRpmdKernelSources::rpmd, replacements), defines);
     pileKernel = program->createKernel("applyPileThermostat");
     stepKernel = program->createKernel("integrateStep");
+    stepKernel2 = program->createKernel("integrateStep2");
     velocitiesKernel = program->createKernel("advanceVelocities");
     copyToContextKernel = program->createKernel("copyDataToContext");
     copyFromContextKernel = program->createKernel("copyDataFromContext");
@@ -182,8 +184,12 @@ void CommonIntegrateRPMDStepKernel::initializeKernels(ContextImpl& context) {
     stepKernel->addArg(positions);
     stepKernel->addArg(velocities);
     stepKernel->addArg(forces);
+    stepKernel->addArg(fftImag);
     stepKernel->addArg();
     stepKernel->addArg();
+    stepKernel2->addArg(positions);
+    stepKernel2->addArg(velocities);
+    stepKernel2->addArg(fftImag);
     velocitiesKernel->addArg(velocities);
     velocitiesKernel->addArg(forces);
     velocitiesKernel->addArg();
@@ -234,24 +240,28 @@ void CommonIntegrateRPMDStepKernel::execute(ContextImpl& context, const RPMDInte
         pileKernel->setArg(3, dt);
         pileKernel->setArg(4, integrator.getTemperature()*BOLTZ);
         pileKernel->setArg(5, integrator.getFriction());
-        stepKernel->setArg(3, dt);
-        stepKernel->setArg(4, integrator.getTemperature()*BOLTZ);
+        stepKernel->setArg(4, dt);
+        stepKernel->setArg(5, integrator.getTemperature()*BOLTZ);
         velocitiesKernel->setArg(2, dt);
     }
     else {
         pileKernel->setArg(3, (float) dt);
         pileKernel->setArg(4, (float) (integrator.getTemperature()*BOLTZ));
         pileKernel->setArg(5, (float) integrator.getFriction());
-        stepKernel->setArg(3, (float) dt);
-        stepKernel->setArg(4, (float) (integrator.getTemperature()*BOLTZ));
+        stepKernel->setArg(4, (float) dt);
+        stepKernel->setArg(5, (float) (integrator.getTemperature()*BOLTZ));
         velocitiesKernel->setArg(2, (float) dt);
     }
     if (integrator.getApplyThermostat())
         pileKernel->execute(numParticles*numCopies, workgroupSize);
 
-    // Update positions and velocities.
-    
+    // Update positions and velocities (forward FFT + thermostat).
+
     stepKernel->execute(numParticles*numCopies, workgroupSize);
+
+    // Apply the inverse FFT and write physical positions/velocities back.
+
+    stepKernel2->execute(numParticles*numCopies, workgroupSize);
 
     // Calculate forces based on the updated positions.
     
@@ -577,3 +587,4 @@ string CommonIntegrateRPMDStepKernel::createFFT(int size, const string& variable
     source<<"}\n";
     return source.str();
 }
+
