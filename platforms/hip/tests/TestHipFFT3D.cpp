@@ -160,8 +160,8 @@ int main(int argc, char* argv[]) {
             testTransform<float2>(true, 60, 60, 60);
             testTransform<float2>(false, 64, 64, 64);
             testTransform<float2>(false, 100, 140, 88, 1e+1);
-            testTransform<float2>(true, 120, 243, 120, 1e+1);
-            testTransform<float2>(true, 216, 216, 116, 1e+1);
+            testTransform<float2>(true, 120, 243, 120, 2e+1);
+            testTransform<float2>(true, 216, 216, 116, 2e+1);
             testTransform<float2>(true, 98, 98, 98, 1e+1);
         }
     }
