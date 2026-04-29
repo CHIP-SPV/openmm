@@ -70,6 +70,10 @@ HipNonbondedUtilities::HipNonbondedUtilities(HipContext& context) : context(cont
     CHECK_RESULT(hipHostMalloc((void**) &pinnedCountBuffer, 2*sizeof(unsigned int), context.getHostMallocFlags()));
     numForceThreadBlocks = 5*4*context.getMultiprocessors();
     forceThreadBlockSize = 64;
+    // Cap to avoid energyBuffer out-of-bounds in energy accumulation
+    int maxForceBlocks = context.getNumThreadBlocks() * HipContext::ThreadBlockSize / forceThreadBlockSize;
+    if (numForceThreadBlocks > maxForceBlocks)
+        numForceThreadBlocks = maxForceBlocks;
     findInteractingBlocksThreadBlockSize = context.getSIMDWidth();
 
     // When building the neighbor list, we can optionally use large blocks (32 * warpSize atoms) to
