@@ -21,6 +21,28 @@
 #define MEM_FENCE __threadfence_block();
 #define ATOMIC_ADD(dest, value) atomicAdd(dest, value)
 
+#ifdef USE_INT64_ATOMIC_ADD_WORKAROUND
+// Intel Arc / IGC bug: OpAtomicIAdd (int32 and int64) fires 4x per call due to
+// a SubgroupSize-32 lowering bug. Use CAS retry loops instead, which map to
+// OpAtomicCompareExchange — a different SPIR-V instruction that is not affected.
+__device__ inline void atomicAddI32(int* addr, int val) {
+    int assumed, old = *addr;
+    do {
+        assumed = old;
+        old = atomicCAS(addr, assumed, assumed + val);
+    } while (assumed != old);
+}
+__device__ inline void atomicAddI64(unsigned long long* addr, unsigned long long val) {
+    unsigned long long assumed, old = *addr;
+    do {
+        assumed = old;
+        old = atomicCAS(addr, assumed, assumed + val);
+    } while (assumed != old);
+}
+#undef ATOMIC_ADD
+#define ATOMIC_ADD(dest, value) atomicAddI64((unsigned long long*)(dest), (unsigned long long)(value))
+#endif
+
 typedef long long mm_long;
 typedef unsigned long long mm_ulong;
 
