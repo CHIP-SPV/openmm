@@ -286,6 +286,9 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
                 skipTiles = end;
             skipBase += TILE_SIZE;
             currentSkipIndex = 0;
+            // chipStar/Intel-GPU workaround: subgroup barrier to ensure updated
+            // skipTiles values are visible across lanes before the next SHFL read.
+            __syncwarp();
         }
         while (SHFL(skipTiles, currentSkipIndex) < pos)
             currentSkipIndex++;
