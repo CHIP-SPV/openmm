@@ -30,8 +30,44 @@
  * USE OR OTHER DEALINGS IN THE SOFTWARE.                                     *
  * -------------------------------------------------------------------------- */
 
+#define CUSTOM_MANY_PARTICLE_MAIN_DEFINED
 #include "HipTests.h"
 #include "TestCustomManyParticleForce.h"
+#include <string>
 
 void runPlatformTests() {
+}
+
+// argv[2] selects a single test by name; if omitted, runs all tests.
+int main(int argc, char* argv[]) {
+    try {
+        if (argc > 1)
+            platform.setPropertyDefaultValue("Precision", std::string(argv[1]));
+        std::string testFilter = (argc > 2) ? std::string(argv[2]) : "";
+
+#define RUN(name) if (testFilter.empty() || testFilter == #name) { name(); if (!testFilter.empty()) { std::cout << "Done" << std::endl; return 0; } }
+#define RUN2(name, arg) if (testFilter.empty() || testFilter == #name) { name(arg); if (!testFilter.empty()) { std::cout << "Done" << std::endl; return 0; } }
+
+        if (testFilter.empty() || testFilter == "testNoCutoff") { testNoCutoff(true); testNoCutoff(false); if (!testFilter.empty()) { std::cout << "Done" << std::endl; return 0; } }
+        if (testFilter.empty() || testFilter == "testCutoff") { testCutoff(true); testCutoff(false); if (!testFilter.empty()) { std::cout << "Done" << std::endl; return 0; } }
+        if (testFilter.empty() || testFilter == "testPeriodic") { testPeriodic(true); testPeriodic(false); if (!testFilter.empty()) { std::cout << "Done" << std::endl; return 0; } }
+        if (testFilter.empty() || testFilter == "testTriclinic") { testTriclinic(true); testTriclinic(false); if (!testFilter.empty()) { std::cout << "Done" << std::endl; return 0; } }
+        RUN(testExclusions)
+        RUN(testAllTerms)
+        RUN(testParameters)
+        RUN(testTabulatedFunctions)
+        RUN(testTypeFilters)
+        RUN(testLargeSystem)
+        RUN(testCentralParticleModeNoCutoff)
+        RUN(testCentralParticleModeCutoff)
+        RUN(testCentralParticleModeLargeSystem)
+        RUN(testIllegalVariable)
+        if (testFilter.empty()) runPlatformTests();
+    }
+    catch(const exception& e) {
+        cout << "exception: " << e.what() << endl;
+        return 1;
+    }
+    cout << "Done" << endl;
+    return 0;
 }
