@@ -380,33 +380,19 @@ void ExpressionUtilities::processExpression(stringstream& out, const ExpressionT
                             out << "int t = min((int) floor(y), " << paramsInt[1] << "-1);\n";
                         }
                         out << "int coeffIndex = 4*(s+" << paramsInt[0] << "*t);\n";
-                        out << "float4 c[4];\n";
-                        for (int j = 0; j < 4; j++)
-                            out << "c[" << j << "] = " << functionNames[i].second << "[coeffIndex+" << j << "];\n";
-                        out << "real da = x-s;\n";
-                        out << "real db = y-t;\n";
+                        // Call a __noinline__ device helper for the polynomial evaluation so
+                        // that LLVM does not inline this block 5x into the kernel body, which
+                        // would make the inner function too large for IGC to inline on Intel Arc.
+                        out << "real interp_val = 0, interp_dx = 0, interp_dy = 0;\n";
+                        out << "interp2D_bicubic_eval(" << functionNames[i].second << ", coeffIndex, x-s, y-t, interp_val, interp_dx, interp_dy);\n";
                         for (int j = 0; j < nodes.size(); j++) {
                             const vector<int>& derivOrder = dynamic_cast<const Operation::Custom*>(&nodes[j]->getOperation())->getDerivOrder();
-                            if (derivOrder[0] == 0 && derivOrder[1] == 0) {
-                                out << nodeNames[j] << suffix << " = da*" << nodeNames[j] << suffix << " + ((c[3].w*db + c[3].z)*db + c[3].y)*db + c[3].x;\n";
-                                out << nodeNames[j] << suffix << " = da*" << nodeNames[j] << suffix << " + ((c[2].w*db + c[2].z)*db + c[2].y)*db + c[2].x;\n";
-                                out << nodeNames[j] << suffix << " = da*" << nodeNames[j] << suffix << " + ((c[1].w*db + c[1].z)*db + c[1].y)*db + c[1].x;\n";
-                                out << nodeNames[j] << suffix << " = da*" << nodeNames[j] << suffix << " + ((c[0].w*db + c[0].z)*db + c[0].y)*db + c[0].x;\n";
-                            }
-                            else if (derivOrder[0] == 1 && derivOrder[1] == 0) {
-                                out << nodeNames[j] << suffix << " = db*" << nodeNames[j] << suffix << " + (3.0f*c[3].w*da + 2.0f*c[2].w)*da + c[1].w;\n";
-                                out << nodeNames[j] << suffix << " = db*" << nodeNames[j] << suffix << " + (3.0f*c[3].z*da + 2.0f*c[2].z)*da + c[1].z;\n";
-                                out << nodeNames[j] << suffix << " = db*" << nodeNames[j] << suffix << " + (3.0f*c[3].y*da + 2.0f*c[2].y)*da + c[1].y;\n";
-                                out << nodeNames[j] << suffix << " = db*" << nodeNames[j] << suffix << " + (3.0f*c[3].x*da + 2.0f*c[2].x)*da + c[1].x;\n";
-                                out << nodeNames[j] << suffix << " *= " << paramsFloat[6] << ";\n";
-                            }
-                            else if (derivOrder[0] == 0 && derivOrder[1] == 1) {
-                                out << nodeNames[j] << suffix << " = da*" << nodeNames[j] << suffix << " + (3.0f*c[3].w*db + 2.0f*c[3].z)*db + c[3].y;\n";
-                                out << nodeNames[j] << suffix << " = da*" << nodeNames[j] << suffix << " + (3.0f*c[2].w*db + 2.0f*c[2].z)*db + c[2].y;\n";
-                                out << nodeNames[j] << suffix << " = da*" << nodeNames[j] << suffix << " + (3.0f*c[1].w*db + 2.0f*c[1].z)*db + c[1].y;\n";
-                                out << nodeNames[j] << suffix << " = da*" << nodeNames[j] << suffix << " + (3.0f*c[0].w*db + 2.0f*c[0].z)*db + c[0].y;\n";
-                                out << nodeNames[j] << suffix << " *= " << paramsFloat[7] << ";\n";
-                            }
+                            if (derivOrder[0] == 0 && derivOrder[1] == 0)
+                                out << nodeNames[j] << suffix << " = interp_val;\n";
+                            else if (derivOrder[0] == 1 && derivOrder[1] == 0)
+                                out << nodeNames[j] << suffix << " = interp_dx * " << paramsFloat[6] << ";\n";
+                            else if (derivOrder[0] == 0 && derivOrder[1] == 1)
+                                out << nodeNames[j] << suffix << " = interp_dy * " << paramsFloat[7] << ";\n";
                             else
                                 throw OpenMMException("Unsupported derivative order for Continuous2DFunction");
                         }
@@ -439,55 +425,18 @@ void ExpressionUtilities::processExpression(stringstream& out, const ExpressionT
                             out << "int u = min((int) floor(z), " << paramsInt[2] << "-1);\n";
                         }
                         out << "int coeffIndex = 16*(s+" << paramsInt[0] << "*(t+" << paramsInt[1] << "*u));\n";
-                        out << "float4 c[16];\n";
-                        for (int j = 0; j < 16; j++)
-                            out << "c[" << j << "] = " << functionNames[i].second << "[coeffIndex+" << j << "];\n";
-                        out << "real da = x-s;\n";
-                        out << "real db = y-t;\n";
-                        out << "real dc = z-u;\n";
+                        out << "real interp3_val = 0, interp3_dx = 0, interp3_dy = 0, interp3_dz = 0;\n";
+                        out << "interp3D_tricubic_eval(" << functionNames[i].second << ", coeffIndex, x-s, y-t, z-u, interp3_val, interp3_dx, interp3_dy, interp3_dz);\n";
                         for (int j = 0; j < nodes.size(); j++) {
                             const vector<int>& derivOrder = dynamic_cast<const Operation::Custom*>(&nodes[j]->getOperation())->getDerivOrder();
-                            if (derivOrder[0] == 0 && derivOrder[1] == 0 && derivOrder[2] == 0) {
-                                out << "real value[4] = {0, 0, 0, 0};\n";
-                                for (int k = 3; k >= 0; k--)
-                                    for (int m = 0; m < 4; m++) {
-                                        int base = k + 4*m;
-                                        out << "value[" << m << "] = db*value[" << m << "] + ((c[" << base << "].w*da + c[" << base << "].z)*da + c[" << base << "].y)*da + c[" << base << "].x;\n";
-                                    }
-                                out << nodeNames[j] << suffix << " = value[0] + dc*(value[1] + dc*(value[2] + dc*value[3]));\n";
-                            }
-                            else if (derivOrder[0] == 1 && derivOrder[1] == 0 && derivOrder[2] == 0) {
-                                out << "real derivx[4] = {0, 0, 0, 0};\n";
-                                for (int k = 3; k >= 0; k--)
-                                    for (int m = 0; m < 4; m++) {
-                                        int base = k + 4*m;
-                                        out << "derivx[" << m << "] = db*derivx[" << m << "] + (3*c[" << base << "].w*da + 2*c[" << base << "].z)*da + c[" << base << "].y;\n";
-                                    }
-                                out << nodeNames[j] << suffix << " = derivx[0] + dc*(derivx[1] + dc*(derivx[2] + dc*derivx[3]));\n";
-                                out << nodeNames[j] << suffix << " *= " << paramsFloat[9] << ";\n";
-                            }
-                            else if (derivOrder[0] == 0 && derivOrder[1] == 1 && derivOrder[2] == 0) {
-                                const string suffixes[] = {".x", ".y", ".z", ".w"};
-                                out << "real derivy[4] = {0, 0, 0, 0};\n";
-                                for (int k = 3; k >= 0; k--)
-                                    for (int m = 0; m < 4; m++) {
-                                        int base = 4*m;
-                                        string suffix = suffixes[k];
-                                        out << "derivy[" << m << "] = da*derivy[" << m << "] + (3*c[" << (base+3) << "]" << suffix << "*db + 2*c[" << (base+2) << "]" << suffix << ")*db + c[" << (base+1) << "]" << suffix << ";\n";
-                                    }
-                                out << nodeNames[j] << suffix << " = derivy[0] + dc*(derivy[1] + dc*(derivy[2] + dc*derivy[3]));\n";
-                                out << nodeNames[j] << suffix << " *= " << paramsFloat[10] << ";\n";
-                            }
-                            else if (derivOrder[0] == 0 && derivOrder[1] == 0 && derivOrder[2] == 1) {
-                                out << "real derivz[4] = {0, 0, 0, 0};\n";
-                                for (int k = 3; k >= 0; k--)
-                                    for (int m = 0; m < 4; m++) {
-                                        int base = k + 4*m;
-                                        out << "derivz[" << m << "] = db*derivz[" << m << "] + ((c[" << base << "].w*da + c[" << base << "].z)*da + c[" << base << "].y)*da + c[" << base << "].x;\n";
-                                    }
-                                out << nodeNames[j] << suffix << " = derivz[1] + dc*(2*derivz[2] + dc*3*derivz[3]);\n";
-                                out << nodeNames[j] << suffix << " *= " << paramsFloat[11] << ";\n";
-                            }
+                            if (derivOrder[0] == 0 && derivOrder[1] == 0 && derivOrder[2] == 0)
+                                out << nodeNames[j] << suffix << " = interp3_val;\n";
+                            else if (derivOrder[0] == 1 && derivOrder[1] == 0 && derivOrder[2] == 0)
+                                out << nodeNames[j] << suffix << " = interp3_dx * " << paramsFloat[9] << ";\n";
+                            else if (derivOrder[0] == 0 && derivOrder[1] == 1 && derivOrder[2] == 0)
+                                out << nodeNames[j] << suffix << " = interp3_dy * " << paramsFloat[10] << ";\n";
+                            else if (derivOrder[0] == 0 && derivOrder[1] == 0 && derivOrder[2] == 1)
+                                out << nodeNames[j] << suffix << " = interp3_dz * " << paramsFloat[11] << ";\n";
                             else
                                 throw OpenMMException("Unsupported derivative order for Continuous3DFunction");
                         }
