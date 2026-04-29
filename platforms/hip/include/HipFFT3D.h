@@ -1,6 +1,8 @@
 #ifndef __OPENMM_HIPFFT3D_H__
 #define __OPENMM_HIPFFT3D_H__
 
+#include <vector>
+
 /* -------------------------------------------------------------------------- *
  *                                   OpenMM                                   *
  * -------------------------------------------------------------------------- *
@@ -93,6 +95,12 @@ private:
     uint64_t inputBufferSize;
     uint64_t outputBufferSize;
     VkFFTApplication* app;
+    // CPU fallback for Intel Arc (chipStar/CHIP-SPV): VkFFT is non-deterministic on that platform.
+    bool cpuFallback;
+    int xsize, ysize, zsize;
+    bool isRealToComplex;
+    std::vector<uint8_t> cpuInBuf;
+    std::vector<uint8_t> cpuOutBuf;
 };
 
 } // namespace OpenMM
