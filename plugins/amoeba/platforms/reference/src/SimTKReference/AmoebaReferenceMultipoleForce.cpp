@@ -4960,7 +4960,7 @@ void AmoebaReferencePmeMultipoleForce::setPeriodicBoxSize(OpenMM::Vec3* vectors)
     _recipBoxVectors[2] = Vec3(vectors[1][0]*vectors[2][1]-vectors[1][1]*vectors[2][0], -vectors[0][0]*vectors[2][1], vectors[0][0]*vectors[1][1])*scale;
 };
 
-int compareInt2(const int2& v1, const int2& v2)
+int compareInt2(const OpenMM::int2& v1, const OpenMM::int2& v2)
 {
     return v1[1] < v2[1];
 }
