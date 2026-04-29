@@ -73,7 +73,9 @@ HipSort::HipSort(HipContext& context, SortTrait* trait, unsigned int length, boo
     if (numBuckets < 1)
         numBuckets = 1;
     // computeBucketPositions is executed as a single work group so larger block size is faster.
-    positionsKernelSize = 1024;
+    // Cap at 512 for Intel Arc via CHIP-SPV which has a hard WGS limit of 512.
+    // The kernel handles any block size via a loop so correctness is unaffected.
+    positionsKernelSize = 512;
     if (positionsKernelSize > numBuckets)
         positionsKernelSize = numBuckets;
 
