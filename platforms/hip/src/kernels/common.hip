@@ -51,24 +51,29 @@ typedef unsigned long long mm_ulong;
 #ifdef USE_DOUBLE_PRECISION
 
 __device__ inline long long realToFixedPoint(double x) {
+    // Guard against NaN using integer bit comparison (not affected by -ffast-math).
+    // NaN has all-ones exponent and non-zero mantissa; Inf has all-ones exponent and
+    // zero mantissa. Inf is handled correctly by the saturating integer cast (same as
+    // CUDA), so we only zero out NaN.
+    // Use __double_as_longlong (HIP intrinsic) for a reliable bitcast in SPIR-V.
+    unsigned long long xbits = static_cast<unsigned long long>(__double_as_longlong(x));
+    if ((xbits & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL &&
+        (xbits & 0x000FFFFFFFFFFFFFULL) != 0ULL) return 0LL;
     return static_cast<long long>(x * 0x100000000);
 }
 
 #else
 
 __device__ inline long long realToFixedPoint(float x) {
-    // Faster way to calculate static_cast<long long>(x * 0x100000000) with exactly the same
-    // results but less instructions.
-    float integral = truncf(x);
-    float fractional = (x - integral) * 0x100000000;
-    unsigned int integral_u32 = static_cast<int>(integral);
-    unsigned int fractional_u32 = static_cast<unsigned int>(fabsf(fractional));
-    // A negative real number (with non-zero fractional) needs rounding-down x for integral and
-    // changing fractional's sign. However, -1 is used as a threshold instead of 0 because, when
-    // fractional is in (-1; 0], fractional_u32 is 0 and the number is considered an integer.
-    bool isNegReal = fractional <= -1.0f;
-    return (static_cast<unsigned long long>(isNegReal ? integral_u32 - 1 : integral_u32) << 32) |
-            static_cast<unsigned long long>(isNegReal ? 0 - fractional_u32 : fractional_u32);
+    // Guard against NaN using integer bit comparison (not affected by -ffast-math).
+    // On Intel GPU (SPIR-V), static_cast<long long>(NaN * scale) returns INT64_MAX instead
+    // of 0 as CUDA does, causing bogus large forces in the fixed-point buffer.
+    // Use __float_as_uint (HIP intrinsic) for a reliable bitcast in SPIR-V.
+    // NaN: all-ones exponent + non-zero mantissa.  Inf: all-ones exponent + zero mantissa.
+    // Inf is handled correctly by the saturating cast on Intel GPU (same as CUDA).
+    unsigned int xbits = __float_as_uint(x);
+    if ((xbits & 0x7F800000u) == 0x7F800000u && (xbits & 0x007FFFFFu) != 0u) return 0LL;
+    return static_cast<long long>(x * (long long)0x100000000LL);
 }
 
 #endif
