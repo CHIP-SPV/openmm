@@ -496,6 +496,100 @@ string HipContext::getCacheFileName(const string& src) const {
     return cacheFile.str();
 }
 
+// Patch SPIR-V embedded in the hiprtc ELF fat binary to mark
+// _computeInteractionHelper with DontInline (FunctionControl=2).
+// LLVM's SPIR-V backend emits None (0) for noinline functions, so
+// spirv-opt --inline-entry-points-exhaustive inlines them, making
+// computeInteraction too large for IGC on Intel Arc.  Setting DontInline
+// tells spirv-opt to leave the function as a separate stack call, keeping
+// computeInteraction small enough for IGC to compile.
+static void patchSPIRVDontInline(std::vector<char>& code) {
+    const uint8_t SPIRV_MAGIC[4] = {0x03, 0x02, 0x23, 0x07};
+    const uint32_t OP_NAME = 5;
+    const uint32_t OP_FUNCTION = 54;
+    const uint32_t DONT_INLINE = 2;
+
+    auto readWord = [&](size_t byteOff) -> uint32_t {
+        uint32_t v; memcpy(&v, code.data() + byteOff, 4); return v;
+    };
+    auto writeWord = [&](size_t byteOff, uint32_t v) {
+        memcpy(code.data() + byteOff, &v, 4);
+    };
+
+    // Find SPIR-V magic in the code (may be embedded in ELF fat binary).
+    size_t spirvByte = code.size();
+    for (size_t i = 0; i + 4 <= code.size(); i += 4) {
+        if (memcmp(code.data() + i, SPIRV_MAGIC, 4) == 0) {
+            spirvByte = i;
+            break;
+        }
+    }
+    if (spirvByte == code.size()) return;
+
+    size_t base = spirvByte;
+    size_t end = code.size();
+
+    // Scan OpName instructions to map result IDs to their C++ names.
+    std::map<uint32_t, std::string> idNames;
+    size_t pos = base + 5 * 4; // skip 5-word SPIR-V header
+    while (pos + 4 <= end) {
+        uint32_t word0 = readWord(pos);
+        uint32_t opcode = word0 & 0xFFFF;
+        uint32_t wc = word0 >> 16;
+        if (wc == 0) break;
+        if (opcode == OP_NAME && pos + wc * 4 <= end) {
+            uint32_t tid = readWord(pos + 4);
+            std::string name;
+            bool done = false;
+            for (uint32_t wi = 2; wi < wc && !done; wi++) {
+                uint32_t w = readWord(pos + wi * 4);
+                for (int k = 0; k < 4 && !done; k++) {
+                    char c = (w >> (k * 8)) & 0xFF;
+                    if (c == 0) { done = true; break; }
+                    name += c;
+                }
+            }
+            idNames[tid] = name;
+        }
+        pos += wc * 4;
+    }
+
+    // For each ID whose name matches a known noinline device helper (not "_exit"),
+    // find its OpFunction and set FunctionControl to DontInline.
+    static const char* noinlinePatterns[] = {
+        "_computeInteractionHelper",
+        "computeOneInteraction",
+        "computeOneInteractionF1",
+        "computeOneInteractionF2",
+        "computeOneInteractionT1",
+        "computeOneInteractionT2",
+        "computeOneInteractionB1",
+        "computeOneInteractionB2",
+        nullptr
+    };
+    auto matchesNoinlinePattern = [&](const std::string& n) {
+        for (int i = 0; noinlinePatterns[i]; i++)
+            if (n.find(noinlinePatterns[i]) != std::string::npos) return true;
+        return false;
+    };
+    for (auto& [id, name] : idNames) {
+        if (!matchesNoinlinePattern(name)) continue;
+        if (name.find("_exit") != std::string::npos) continue;
+
+        size_t p = base + 5 * 4;
+        while (p + 5 * 4 <= end) {
+            uint32_t word0 = readWord(p);
+            uint32_t opcode = word0 & 0xFFFF;
+            uint32_t wc = word0 >> 16;
+            if (wc == 0) break;
+            if (opcode == OP_FUNCTION && wc >= 5 && readWord(p + 2 * 4) == id) {
+                writeWord(p + 3 * 4, DONT_INLINE);
+                break;
+            }
+            p += wc * 4;
+        }
+    }
+}
 hipModule_t HipContext::createModule(const string source) {
     return createModule(source, map<string, string>());
 }
@@ -668,6 +762,20 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
         hiprtcGetCode(program, &code[0]);
         hiprtcDestroyProgram(&program);
 
+        // Patch _computeInteractionHelper with DontInline so spirv-opt keeps it
+        // as a separate stack-call function and doesn't inline it into
+        // computeInteraction (which would make computeInteraction too large for IGC).
+        patchSPIRVDontInline(code);
+
+        if (saveTemps) {
+            stringstream spirvName;
+            const char* saveTempsPrefixEnv2 = getenv("OPENMM_SAVE_TEMPS_PREFIX");
+            if (saveTempsPrefixEnv2) spirvName << saveTempsPrefixEnv2;
+            spirvName << getHash(src.str()) << ".spv";
+            ofstream spirvOut(spirvName.str().c_str(), ios::out | ios::binary);
+            spirvOut.write(&code[0], code.size());
+            std::cout << "SPIR-V saved: " << spirvName.str() << std::endl;
+        }
         // If possible, write the CO out to a cache file for later use.
 
         try {
