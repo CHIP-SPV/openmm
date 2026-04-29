@@ -273,11 +273,11 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
 
     // Set defines based on the requested precision.
 
-    compilationDefines["SQRT"] = useDoublePrecision ? "sqrt" : "__fsqrt_rn";
-    compilationDefines["RSQRT"] = useDoublePrecision ? "rsqrt" : "__frsqrt_rn";
+    compilationDefines["SQRT"] = useDoublePrecision ? "sqrt" : "sqrtf";
+    compilationDefines["RSQRT"] = useDoublePrecision ? "rsqrt" : "rsqrtf";
     compilationDefines["RECIP(x)"] = useDoublePrecision ? "(1.0/(x))" : "(1.0f/(x))";
-    compilationDefines["EXP"] = useDoublePrecision ? "exp" : "__expf";
-    compilationDefines["LOG"] = useDoublePrecision ? "log" : "__logf";
+    compilationDefines["EXP"] = useDoublePrecision ? "exp" : "expf";
+    compilationDefines["LOG"] = useDoublePrecision ? "log" : "logf";
     compilationDefines["POW"] = useDoublePrecision ? "pow" : "powf";
     compilationDefines["COS"] = useDoublePrecision ? "cos" : "cosf";
     compilationDefines["SIN"] = useDoublePrecision ? "sin" : "sinf";
@@ -301,54 +301,54 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
     if (boxIsTriclinic) {
         compilationDefines["APPLY_PERIODIC_TO_DELTA(delta)"] =
             "{"
-            "real scale3 = floor(delta.z*invPeriodicBoxSize.z+0.5f); \\\n"
+            "real scale3 = floorf(delta.z*invPeriodicBoxSize.z+0.5f); \\\n"
             "delta.x -= scale3*periodicBoxVecZ.x; \\\n"
             "delta.y -= scale3*periodicBoxVecZ.y; \\\n"
             "delta.z -= scale3*periodicBoxVecZ.z; \\\n"
-            "real scale2 = floor(delta.y*invPeriodicBoxSize.y+0.5f); \\\n"
+            "real scale2 = floorf(delta.y*invPeriodicBoxSize.y+0.5f); \\\n"
             "delta.x -= scale2*periodicBoxVecY.x; \\\n"
             "delta.y -= scale2*periodicBoxVecY.y; \\\n"
-            "real scale1 = floor(delta.x*invPeriodicBoxSize.x+0.5f); \\\n"
+            "real scale1 = floorf(delta.x*invPeriodicBoxSize.x+0.5f); \\\n"
             "delta.x -= scale1*periodicBoxVecX.x;}";
         compilationDefines["APPLY_PERIODIC_TO_POS(pos)"] =
             "{"
-            "real scale3 = floor(pos.z*invPeriodicBoxSize.z); \\\n"
+            "real scale3 = floorf(pos.z*invPeriodicBoxSize.z); \\\n"
             "pos.x -= scale3*periodicBoxVecZ.x; \\\n"
             "pos.y -= scale3*periodicBoxVecZ.y; \\\n"
             "pos.z -= scale3*periodicBoxVecZ.z; \\\n"
-            "real scale2 = floor(pos.y*invPeriodicBoxSize.y); \\\n"
+            "real scale2 = floorf(pos.y*invPeriodicBoxSize.y); \\\n"
             "pos.x -= scale2*periodicBoxVecY.x; \\\n"
             "pos.y -= scale2*periodicBoxVecY.y; \\\n"
-            "real scale1 = floor(pos.x*invPeriodicBoxSize.x); \\\n"
+            "real scale1 = floorf(pos.x*invPeriodicBoxSize.x); \\\n"
             "pos.x -= scale1*periodicBoxVecX.x;}";
         compilationDefines["APPLY_PERIODIC_TO_POS_WITH_CENTER(pos, center)"] =
             "{"
-            "real scale3 = floor((pos.z-center.z)*invPeriodicBoxSize.z+0.5f); \\\n"
+            "real scale3 = floorf((pos.z-center.z)*invPeriodicBoxSize.z+0.5f); \\\n"
             "pos.x -= scale3*periodicBoxVecZ.x; \\\n"
             "pos.y -= scale3*periodicBoxVecZ.y; \\\n"
             "pos.z -= scale3*periodicBoxVecZ.z; \\\n"
-            "real scale2 = floor((pos.y-center.y)*invPeriodicBoxSize.y+0.5f); \\\n"
+            "real scale2 = floorf((pos.y-center.y)*invPeriodicBoxSize.y+0.5f); \\\n"
             "pos.x -= scale2*periodicBoxVecY.x; \\\n"
             "pos.y -= scale2*periodicBoxVecY.y; \\\n"
-            "real scale1 = floor((pos.x-center.x)*invPeriodicBoxSize.x+0.5f); \\\n"
+            "real scale1 = floorf((pos.x-center.x)*invPeriodicBoxSize.x+0.5f); \\\n"
             "pos.x -= scale1*periodicBoxVecX.x;}";
     }
     else {
         compilationDefines["APPLY_PERIODIC_TO_DELTA(delta)"] =
             "{"
-            "delta.x -= floor(delta.x*invPeriodicBoxSize.x+0.5f)*periodicBoxSize.x; \\\n"
-            "delta.y -= floor(delta.y*invPeriodicBoxSize.y+0.5f)*periodicBoxSize.y; \\\n"
-            "delta.z -= floor(delta.z*invPeriodicBoxSize.z+0.5f)*periodicBoxSize.z;}";
+            "delta.x -= floorf(delta.x*invPeriodicBoxSize.x+0.5f)*periodicBoxSize.x; \\\n"
+            "delta.y -= floorf(delta.y*invPeriodicBoxSize.y+0.5f)*periodicBoxSize.y; \\\n"
+            "delta.z -= floorf(delta.z*invPeriodicBoxSize.z+0.5f)*periodicBoxSize.z;}";
         compilationDefines["APPLY_PERIODIC_TO_POS(pos)"] =
             "{"
-            "pos.x -= floor(pos.x*invPeriodicBoxSize.x)*periodicBoxSize.x; \\\n"
-            "pos.y -= floor(pos.y*invPeriodicBoxSize.y)*periodicBoxSize.y; \\\n"
-            "pos.z -= floor(pos.z*invPeriodicBoxSize.z)*periodicBoxSize.z;}";
+            "pos.x -= floorf(pos.x*invPeriodicBoxSize.x)*periodicBoxSize.x; \\\n"
+            "pos.y -= floorf(pos.y*invPeriodicBoxSize.y)*periodicBoxSize.y; \\\n"
+            "pos.z -= floorf(pos.z*invPeriodicBoxSize.z)*periodicBoxSize.z;}";
         compilationDefines["APPLY_PERIODIC_TO_POS_WITH_CENTER(pos, center)"] =
             "{"
-            "pos.x -= floor((pos.x-center.x)*invPeriodicBoxSize.x+0.5f)*periodicBoxSize.x; \\\n"
-            "pos.y -= floor((pos.y-center.y)*invPeriodicBoxSize.y+0.5f)*periodicBoxSize.y; \\\n"
-            "pos.z -= floor((pos.z-center.z)*invPeriodicBoxSize.z+0.5f)*periodicBoxSize.z;}";
+            "pos.x -= floorf((pos.x-center.x)*invPeriodicBoxSize.x+0.5f)*periodicBoxSize.x; \\\n"
+            "pos.y -= floorf((pos.y-center.y)*invPeriodicBoxSize.y+0.5f)*periodicBoxSize.y; \\\n"
+            "pos.z -= floorf((pos.z-center.z)*invPeriodicBoxSize.z+0.5f)*periodicBoxSize.z;}";
     }
 
     // Create utilities objects.
