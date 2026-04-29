@@ -107,7 +107,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #ifdef USE_CUTOFF
                 if (r2 < MAX_CUTOFF_SQUARED) {
 #endif
-                    real invR = RSQRT(r2);
+                    real invR = r2 > 0 ? RSQRT(r2) : (real) 0;
                     real r = r2*invR;
                     LOAD_ATOM2_PARAMETERS
                     int atom2 = y*TILE_SIZE+j;
@@ -170,7 +170,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #ifdef USE_CUTOFF
                 if (r2 < MAX_CUTOFF_SQUARED) {
 #endif
-                    real invR = RSQRT(r2);
+                    real invR = r2 > 0 ? RSQRT(r2) : (real) 0;
                     real r = r2*invR;
                     LOAD_ATOM2_PARAMETERS
                     int atom2 = atomIndex;
@@ -335,7 +335,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #ifdef USE_CUTOFF
                     if (r2 < MAX_CUTOFF_SQUARED) {
 #endif
-                        real invR = RSQRT(r2);
+                        real invR = r2 > 0 ? RSQRT(r2) : (real) 0;
                         real r = r2*invR;
                         LOAD_ATOM2_PARAMETERS
                         int atom2 = atomIndex;
@@ -394,7 +394,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
 #ifdef USE_CUTOFF
                     if (r2 < MAX_CUTOFF_SQUARED) {
 #endif
-                        real invR = RSQRT(r2);
+                        real invR = r2 > 0 ? RSQRT(r2) : (real) 0;
                         real r = r2*invR;
                         LOAD_ATOM2_PARAMETERS
                         int atom2 = atomIndex;
@@ -477,7 +477,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
             DECLARE_LOCAL_PARAMETERS
             LOAD_LOCAL_PARAMETERS_FROM_GLOBAL
             LOAD_ATOM2_PARAMETERS
-            real invR = RSQRT(r2);
+            real invR = r2 > 0 ? RSQRT(r2) : (real) 0;
             real r = r2*invR;
 #ifdef USE_SYMMETRIC
             real dEdR = 0.0f;
