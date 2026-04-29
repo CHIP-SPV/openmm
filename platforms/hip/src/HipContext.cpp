@@ -590,6 +590,7 @@ static void patchSPIRVDontInline(std::vector<char>& code) {
         }
     }
 }
+
 hipModule_t HipContext::createModule(const string source) {
     return createModule(source, map<string, string>());
 }
@@ -776,6 +777,7 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
             spirvOut.write(&code[0], code.size());
             std::cout << "SPIR-V saved: " << spirvName.str() << std::endl;
         }
+
         // If possible, write the CO out to a cache file for later use.
 
         try {
