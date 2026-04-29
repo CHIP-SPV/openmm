@@ -60,7 +60,7 @@
  *
  */
 extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded(
-        unsigned long long* __restrict__ forceBuffers, mixed* __restrict__ energyBuffer, const real4* __restrict__ posq, const tileflags* __restrict__ exclusions,
+        unsigned long long* __restrict__ forceBuffers, real* __restrict__ energyBuffer, const real4* __restrict__ posq, const tileflags* __restrict__ exclusions,
         const int2* __restrict__ exclusionTiles, unsigned int startTileIndex, unsigned long long numTileIndices
 #ifdef USE_CUTOFF
         , const int* __restrict__ tiles, const unsigned int* __restrict__ interactionCount, real4 periodicBoxSize, real4 invPeriodicBoxSize,
@@ -73,7 +73,7 @@ extern "C" __launch_bounds__(THREAD_BLOCK_SIZE) __global__ void computeNonbonded
     const unsigned int warp = blockIdx.x*(THREAD_BLOCK_SIZE/TILE_SIZE) + threadIdx.x/TILE_SIZE; // global warpIndex
     const unsigned int tgx = threadIdx.x & (TILE_SIZE-1); // index within the warp
     const unsigned int tbx = threadIdx.x - tgx;           // block warpIndex
-    mixed energy = 0;
+    real energy = 0;
     INIT_DERIVATIVES
 
     // First loop: process tiles that contain exclusions.

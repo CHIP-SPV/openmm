@@ -344,6 +344,7 @@ private:
     HipArray largeBlockBoundingBox;
     HipArray oldPositions;
     HipArray rebuildNeighborList;
+    HipArray realEnergyBuffer;
     HipSort* blockSorter;
     hipEvent_t downloadCountEvent;
     unsigned int* pinnedCountBuffer;

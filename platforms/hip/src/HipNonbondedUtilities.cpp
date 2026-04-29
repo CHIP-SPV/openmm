@@ -69,7 +69,15 @@ HipNonbondedUtilities::HipNonbondedUtilities(HipContext& context) : context(cont
     CHECK_RESULT(hipEventCreateWithFlags(&downloadCountEvent, context.getEventFlags()));
     CHECK_RESULT(hipHostMalloc((void**) &pinnedCountBuffer, 2*sizeof(unsigned int), context.getHostMallocFlags()));
     numForceThreadBlocks = 5*4*context.getMultiprocessors();
-    forceThreadBlockSize = 64;
+    // Intel Arc GPUs have a tight per-workgroup private memory limit (~128KB).
+    // Large kernels like computeBornSum use ~2340B/thread via IGC stack calls,
+    // so 64 threads/workgroup = ~149KB which exceeds the limit. Use 32 instead.
+    {
+        hipDeviceProp_t props;
+        hipGetDeviceProperties(&props, context.getDevice());
+        bool isIntelGPU = (std::string(props.name).find("Intel") != std::string::npos);
+        forceThreadBlockSize = isIntelGPU ? 32 : 64;
+    }
     // Cap to avoid energyBuffer out-of-bounds in energy accumulation
     int maxForceBlocks = context.getNumThreadBlocks() * HipContext::ThreadBlockSize / forceThreadBlockSize;
     if (numForceThreadBlocks > maxForceBlocks)
@@ -321,7 +329,19 @@ void HipNonbondedUtilities::initialize(const System& system) {
     // Record arguments for kernels.
 
     forceArgs.push_back(&context.getForce().getDevicePointer());
-    forceArgs.push_back(&context.getEnergyBuffer().getDevicePointer());
+    // In mixed precision, the nonbonded kernel writes energy to a float scratch buffer
+    // to avoid fp64 in computeNonbonded (fp64 + SIMD32 is incompatible on Intel Arc/Xe-HPG).
+    // The float values are accumulated into the double energyBuffer by accumulateRealEnergy
+    // after each kernel launch.
+    if (context.getUseMixedPrecision()) {
+        int numEnergyBuffers = numForceThreadBlocks * forceThreadBlockSize;
+        realEnergyBuffer.initialize<float>(context, numEnergyBuffers, "realEnergyBuffer");
+        context.addAutoclearBuffer(realEnergyBuffer.getDevicePointer(), numEnergyBuffers * sizeof(float));
+        forceArgs.push_back(&realEnergyBuffer.getDevicePointer());
+    }
+    else {
+        forceArgs.push_back(&context.getEnergyBuffer().getDevicePointer());
+    }
     forceArgs.push_back(&context.getPosq().getDevicePointer());
     forceArgs.push_back(&exclusions.getDevicePointer());
     forceArgs.push_back(&exclusionTiles.getDevicePointer());
@@ -466,6 +486,14 @@ void HipNonbondedUtilities::computeInteractions(int forceGroups, bool includeFor
         if (kernel == NULL)
             kernel = createInteractionKernel(kernels.source, parameters, arguments, true, true, forceGroups, includeForces, includeEnergy);
         context.executeKernelFlat(kernel, &forceArgs[0], numForceThreadBlocks*forceThreadBlockSize, forceThreadBlockSize);
+        // In mixed precision, accumulate the float scratch energy buffer into the double energyBuffer.
+        if (context.getUseMixedPrecision() && includeEnergy) {
+            int n = realEnergyBuffer.getSize();
+            void* accArgs[] = {&realEnergyBuffer.getDevicePointer(),
+                               &context.getEnergyBuffer().getDevicePointer(),
+                               &n};
+            context.executeKernel(context.getAccumulateRealEnergyKernel(), accArgs, n);
+        }
     }
     if (useNeighborList && numTiles > 0) {
         hipEventSynchronize(downloadCountEvent);
