@@ -504,7 +504,7 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
     int runtimeVersion;
     CHECK_RESULT2(hipRuntimeGetVersion(&runtimeVersion), "Error getting HIP runtime version");
 
-    string options = "-O3 -ffast-math -munsafe-fp-atomics -Wall -Wno-hip-only";
+    string options = "-O3 -Wall -Wno-hip-only";
     options += " --offload-arch=" + gpuArchitecture;
     if (gpuArchitecture.find("gfx90a") == 0 ||
         gpuArchitecture.find("gfx94") == 0) {
@@ -620,7 +620,7 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
     hiprtcProgram program;
     HIPRTC_CHECK_RESULT(hiprtcCreateProgram(&program, src.str().c_str(), NULL, 0, NULL, NULL), "Error creating program");
     try {
-        hiprtcResult result = hiprtcCompileProgram(program, optionsVec.size(), &optionsVec[0]);
+        hiprtcResult result = hiprtcCompileProgram(program, 0, &optionsVec[0]);
         if (result != HIPRTC_SUCCESS || saveTemps) {
             size_t logSize;
             hiprtcGetProgramLogSize(program, &logSize);
