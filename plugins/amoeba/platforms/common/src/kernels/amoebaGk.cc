@@ -351,11 +351,12 @@ typedef struct {
 #define ATOM2_ARG_SPEC volatile
 #endif
 
-DEVICE void computeOneInteractionF1(AtomData2 atom1, ATOM2_ARG_SPEC AtomData2 atom2, real* outputEnergy, real3* force);
-DEVICE void computeOneInteractionF2(AtomData2 atom1, ATOM2_ARG_SPEC AtomData2 atom2, real* outputEnergy, real3* force);
-DEVICE void computeOneInteractionT1(AtomData2 atom1, ATOM2_ARG_SPEC AtomData2 atom2, real3* torque);
-DEVICE void computeOneInteractionT2(AtomData2 atom1, ATOM2_ARG_SPEC AtomData2 atom2, real3* torque);
-DEVICE void computeOneInteractionB1B2(AtomData2 atom1, ATOM2_ARG_SPEC AtomData2 atom2, real* bornForce1, real* bornForce2);
+DEVICE __attribute__((noinline)) void computeOneInteractionF1(const AtomData2* atom1, const AtomData2* atom2, real* outputEnergy, real3* force, GLOBAL const float* _gkDummy);
+DEVICE __attribute__((noinline)) void computeOneInteractionF2(const AtomData2* atom1, const AtomData2* atom2, real* outputEnergy, real3* force, GLOBAL const float* _gkDummy);
+DEVICE __attribute__((noinline)) void computeOneInteractionT1(const AtomData2* atom1, const AtomData2* atom2, real3* torque, GLOBAL const float* _gkDummy);
+DEVICE __attribute__((noinline)) void computeOneInteractionT2(const AtomData2* atom1, const AtomData2* atom2, real3* torque, GLOBAL const float* _gkDummy);
+DEVICE __attribute__((noinline)) void computeOneInteractionB1(const AtomData2* atom1, const AtomData2* atom2, real* bornForce1, real* bornForce2, GLOBAL const float* _gkDummy);
+DEVICE __attribute__((noinline)) void computeOneInteractionB2(const AtomData2* atom1, const AtomData2* atom2, real* bornForce1, real* bornForce2, GLOBAL const float* _gkDummy);
 
 inline DEVICE AtomData2 loadAtomData2(int atom, GLOBAL const real4* RESTRICT posq, GLOBAL const real* RESTRICT labFrameDipole,
         GLOBAL const real* RESTRICT labFrameQuadrupole, GLOBAL const real* RESTRICT inducedDipole, GLOBAL const real* RESTRICT inducedDipolePolar, GLOBAL const real* RESTRICT bornRadius) {
@@ -382,10 +383,10 @@ inline DEVICE AtomData2 loadAtomData2(int atom, GLOBAL const real4* RESTRICT pos
  * Compute electrostatic interactions.
  */
 KERNEL void computeGKForces(
-        GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL mm_ulong* RESTRICT torqueBuffers, GLOBAL mixed* RESTRICT energyBuffer,
+        GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL mixed* RESTRICT energyBuffer,
         GLOBAL const real4* RESTRICT posq, unsigned int startTileIndex, unsigned int numTileIndices, GLOBAL const real* RESTRICT labFrameDipole,
         GLOBAL const real* RESTRICT labFrameQuadrupole, GLOBAL const real* RESTRICT inducedDipole, GLOBAL const real* RESTRICT inducedDipolePolar,
-        GLOBAL const real* RESTRICT bornRadii, GLOBAL mm_ulong* RESTRICT bornForce) {
+        GLOBAL const real* RESTRICT bornRadii) {
     unsigned int totalWarps = (GLOBAL_SIZE)/TILE_SIZE;
     unsigned int warp = (GLOBAL_ID)/TILE_SIZE;
     const unsigned int numTiles = numTileIndices;
@@ -393,16 +394,14 @@ KERNEL void computeGKForces(
     unsigned int end = (unsigned int) (startTileIndex+(warp+1)*(mm_long)numTiles/totalWarps);
     mixed energy = 0;
     LOCAL AtomData2 localData[GK_FORCE_THREAD_BLOCK_SIZE];
-    
     do {
-        // Extract the coordinates of this tile
         const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
         const unsigned int tbx = LOCAL_ID - tgx;
         int x, y;
         if (pos < end) {
             y = (int) floor(NUM_BLOCKS+0.5f-SQRT((NUM_BLOCKS+0.5f)*(NUM_BLOCKS+0.5f)-2*pos));
             x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
-            if (x < y || x >= NUM_BLOCKS) { // Occasionally happens due to roundoff error.
+            if (x < y || x >= NUM_BLOCKS) {
                 y += (x < y ? -1 : 1);
                 x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
             }
@@ -411,10 +410,8 @@ KERNEL void computeGKForces(
             data.force = make_real3(0);
             data.bornForce = 0;
             if (pos >= end)
-                ; // This warp is done.
+                ;
             else if (x == y) {
-                // This tile is on the diagonal.
-
                 localData[LOCAL_ID].pos = data.pos;
                 localData[LOCAL_ID].q = data.q;
                 localData[LOCAL_ID].dipole = data.dipole;
@@ -428,16 +425,13 @@ KERNEL void computeGKForces(
                 localData[LOCAL_ID].inducedDipolePolar = data.inducedDipolePolar;
                 localData[LOCAL_ID].bornRadius = data.bornRadius;
                 SYNC_WARPS;
-                
-                // Compute forces.
-                
                 for (unsigned int j = 0; j < TILE_SIZE; j++) {
                     int atom2 = y*TILE_SIZE+j;
                     if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
                         real3 tempForce;
                         real tempEnergy;
-                        computeOneInteractionF1(data, localData[tbx+j], &tempEnergy, &tempForce);
-                        computeOneInteractionF2(data, localData[tbx+j], &tempEnergy, &tempForce);
+                        computeOneInteractionF1(&data, &localData[tbx+j], &tempEnergy, &tempForce, (GLOBAL const float*) forceBuffers);
+                        computeOneInteractionF2(&data, &localData[tbx+j], &tempEnergy, &tempForce, (GLOBAL const float*) forceBuffers);
                         data.force += tempForce;
                         energy += 0.5f*tempEnergy;
                     }
@@ -447,44 +441,8 @@ KERNEL void computeGKForces(
                 ATOMIC_ADD(&forceBuffers[atom1], (mm_ulong) realToFixedPoint(data.force.x));
                 ATOMIC_ADD(&forceBuffers[atom1+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.force.y));
                 ATOMIC_ADD(&forceBuffers[atom1+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.force.z));
-
-                // Compute torques.
-                
-                data.force = make_real3(0);
-                data.bornForce = 0;
-                for (unsigned int j = 0; j < TILE_SIZE; j++) {
-                    int atom2 = y*TILE_SIZE+j;
-                    if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
-                        real3 tempTorque;
-                        computeOneInteractionT1(data, localData[tbx+j], &tempTorque);
-                        computeOneInteractionT2(data, localData[tbx+j], &tempTorque);
-                        data.force += tempTorque;
-                    }
-                }
-                SYNC_WARPS;
-                ATOMIC_ADD(&torqueBuffers[atom1], (mm_ulong) realToFixedPoint(data.force.x));
-                ATOMIC_ADD(&torqueBuffers[atom1+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.force.y));
-                ATOMIC_ADD(&torqueBuffers[atom1+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.force.z));
-
-                // Compute chain rule terms.
-                
-                data.force = make_real3(0);
-                data.bornForce = 0;
-                for (unsigned int j = 0; j < TILE_SIZE; j++) {
-                    int atom2 = y*TILE_SIZE+j;
-                    if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
-                        real bornForce1 = 0, bornForce2 = 0;
-                        computeOneInteractionB1B2(data, localData[tbx+j], &bornForce1, &bornForce2);
-                        data.bornForce += bornForce1;
-                        localData[tbx+j].bornForce += bornForce2;
-                        SYNC_WARPS;
-                    }
-                }
-                ATOMIC_ADD(&bornForce[atom1], (mm_ulong) realToFixedPoint(data.bornForce));
             }
             else {
-                // This is an off-diagonal tile.
-
                 unsigned int j = y*TILE_SIZE + tgx;
                 localData[LOCAL_ID] = loadAtomData2(j, posq, labFrameDipole, labFrameQuadrupole, inducedDipole, inducedDipolePolar, bornRadii);
                 localData[LOCAL_ID].force = make_real3(0);
@@ -496,8 +454,8 @@ KERNEL void computeGKForces(
                     if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
                         real3 tempForce;
                         real tempEnergy;
-                        computeOneInteractionF1(data, localData[tbx+tj], &tempEnergy, &tempForce);
-                        computeOneInteractionF2(data, localData[tbx+tj], &tempEnergy, &tempForce);
+                        computeOneInteractionF1(&data, &localData[tbx+tj], &tempEnergy, &tempForce, (GLOBAL const float*) forceBuffers);
+                        computeOneInteractionF2(&data, &localData[tbx+tj], &tempEnergy, &tempForce, (GLOBAL const float*) forceBuffers);
                         data.force += tempForce;
                         localData[tbx+tj].force -= tempForce;
                         energy += tempEnergy;
@@ -517,24 +475,84 @@ KERNEL void computeGKForces(
                     ATOMIC_ADD(&forceBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].force.y));
                     ATOMIC_ADD(&forceBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].force.z));
                 }
+            }
+        }
+        pos++;
+    } while (pos < end);
+    energyBuffer[GLOBAL_ID] += energy*0.5f;
+}
 
-                // Compute torques.
-
-                data.force = make_real3(0);
-                data.bornForce = 0;
+// Compute T1+T2 torques for atom1 (all tiles) and write to torqueBuffers.
+KERNEL void computeGKTorquesA(
+        GLOBAL mm_ulong* RESTRICT torqueBuffers,
+        GLOBAL const real4* RESTRICT posq, unsigned int startTileIndex, unsigned int numTileIndices, GLOBAL const real* RESTRICT labFrameDipole,
+        GLOBAL const real* RESTRICT labFrameQuadrupole, GLOBAL const real* RESTRICT inducedDipole, GLOBAL const real* RESTRICT inducedDipolePolar,
+        GLOBAL const real* RESTRICT bornRadii) {
+    unsigned int totalWarps = (GLOBAL_SIZE)/TILE_SIZE;
+    unsigned int warp = (GLOBAL_ID)/TILE_SIZE;
+    const unsigned int numTiles = numTileIndices;
+    unsigned int pos = (unsigned int) (startTileIndex+warp*(mm_long)numTiles/totalWarps);
+    unsigned int end = (unsigned int) (startTileIndex+(warp+1)*(mm_long)numTiles/totalWarps);
+    LOCAL AtomData2 localData[GK_FORCE_THREAD_BLOCK_SIZE];
+    do {
+        const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
+        const unsigned int tbx = LOCAL_ID - tgx;
+        int x, y;
+        if (pos < end) {
+            y = (int) floor(NUM_BLOCKS+0.5f-SQRT((NUM_BLOCKS+0.5f)*(NUM_BLOCKS+0.5f)-2*pos));
+            x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
+            if (x < y || x >= NUM_BLOCKS) {
+                y += (x < y ? -1 : 1);
+                x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
+            }
+            unsigned int atom1 = x*TILE_SIZE + tgx;
+            AtomData2 data = loadAtomData2(atom1, posq, labFrameDipole, labFrameQuadrupole, inducedDipole, inducedDipolePolar, bornRadii);
+            data.force = make_real3(0);
+            data.bornForce = 0;
+            if (pos >= end)
+                ;
+            else if (x == y) {
+                localData[LOCAL_ID].pos = data.pos;
+                localData[LOCAL_ID].q = data.q;
+                localData[LOCAL_ID].dipole = data.dipole;
+                localData[LOCAL_ID].quadrupoleXX = data.quadrupoleXX;
+                localData[LOCAL_ID].quadrupoleXY = data.quadrupoleXY;
+                localData[LOCAL_ID].quadrupoleXZ = data.quadrupoleXZ;
+                localData[LOCAL_ID].quadrupoleYY = data.quadrupoleYY;
+                localData[LOCAL_ID].quadrupoleYZ = data.quadrupoleYZ;
+                localData[LOCAL_ID].quadrupoleZZ = data.quadrupoleZZ;
+                localData[LOCAL_ID].inducedDipole = data.inducedDipole;
+                localData[LOCAL_ID].inducedDipolePolar = data.inducedDipolePolar;
+                localData[LOCAL_ID].bornRadius = data.bornRadius;
+                SYNC_WARPS;
+                for (unsigned int j = 0; j < TILE_SIZE; j++) {
+                    int atom2 = y*TILE_SIZE+j;
+                    if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
+                        real3 tempTorque;
+                        computeOneInteractionT1(&data, &localData[tbx+j], &tempTorque, (GLOBAL const float*) torqueBuffers);
+                        computeOneInteractionT2(&data, &localData[tbx+j], &tempTorque, (GLOBAL const float*) torqueBuffers);
+                        data.force += tempTorque;
+                    }
+                }
+                SYNC_WARPS;
+                ATOMIC_ADD(&torqueBuffers[atom1], (mm_ulong) realToFixedPoint(data.force.x));
+                ATOMIC_ADD(&torqueBuffers[atom1+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.force.y));
+                ATOMIC_ADD(&torqueBuffers[atom1+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.force.z));
+            }
+            else {
+                unsigned int j = y*TILE_SIZE + tgx;
+                localData[LOCAL_ID] = loadAtomData2(j, posq, labFrameDipole, labFrameQuadrupole, inducedDipole, inducedDipolePolar, bornRadii);
                 localData[LOCAL_ID].force = make_real3(0);
                 localData[LOCAL_ID].bornForce = 0;
                 SYNC_WARPS;
+                unsigned int tj = tgx;
                 for (j = 0; j < TILE_SIZE; j++) {
                     int atom2 = y*TILE_SIZE+tj;
                     if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
                         real3 tempTorque;
-                        computeOneInteractionT1(data, localData[tbx+tj], &tempTorque);
-                        computeOneInteractionT2(data, localData[tbx+tj], &tempTorque);
+                        computeOneInteractionT1(&data, &localData[tbx+tj], &tempTorque, (GLOBAL const float*) torqueBuffers);
+                        computeOneInteractionT2(&data, &localData[tbx+tj], &tempTorque, (GLOBAL const float*) torqueBuffers);
                         data.force += tempTorque;
-                        computeOneInteractionT1(localData[tbx+tj], data, &tempTorque);
-                        computeOneInteractionT2(localData[tbx+tj], data, &tempTorque);
-                        localData[tbx+tj].force += tempTorque;
                     }
                     tj = (tj + 1) & (TILE_SIZE - 1);
                     SYNC_WARPS;
@@ -544,24 +562,138 @@ KERNEL void computeGKForces(
                     ATOMIC_ADD(&torqueBuffers[offset], (mm_ulong) realToFixedPoint(data.force.x));
                     ATOMIC_ADD(&torqueBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.force.y));
                     ATOMIC_ADD(&torqueBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(data.force.z));
-                    offset = y*TILE_SIZE + tgx;
-                    ATOMIC_ADD(&torqueBuffers[offset], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].force.x));
-                    ATOMIC_ADD(&torqueBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].force.y));
-                    ATOMIC_ADD(&torqueBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].force.z));
                 }
+            }
+        }
+        pos++;
+    } while (pos < end);
+}
 
-                // Compute chain rule terms.
-
+// Compute T1+T2 torques for atom2 (off-diagonal tiles only) and write to torqueBuffers.
+KERNEL void computeGKTorquesB(
+        GLOBAL mm_ulong* RESTRICT torqueBuffers,
+        GLOBAL const real4* RESTRICT posq, unsigned int startTileIndex, unsigned int numTileIndices, GLOBAL const real* RESTRICT labFrameDipole,
+        GLOBAL const real* RESTRICT labFrameQuadrupole, GLOBAL const real* RESTRICT inducedDipole, GLOBAL const real* RESTRICT inducedDipolePolar,
+        GLOBAL const real* RESTRICT bornRadii) {
+    unsigned int totalWarps = (GLOBAL_SIZE)/TILE_SIZE;
+    unsigned int warp = (GLOBAL_ID)/TILE_SIZE;
+    const unsigned int numTiles = numTileIndices;
+    unsigned int pos = (unsigned int) (startTileIndex+warp*(mm_long)numTiles/totalWarps);
+    unsigned int end = (unsigned int) (startTileIndex+(warp+1)*(mm_long)numTiles/totalWarps);
+    LOCAL AtomData2 localData[GK_FORCE_THREAD_BLOCK_SIZE];
+    do {
+        const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
+        const unsigned int tbx = LOCAL_ID - tgx;
+        int x, y;
+        if (pos < end) {
+            y = (int) floor(NUM_BLOCKS+0.5f-SQRT((NUM_BLOCKS+0.5f)*(NUM_BLOCKS+0.5f)-2*pos));
+            x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
+            if (x < y || x >= NUM_BLOCKS) {
+                y += (x < y ? -1 : 1);
+                x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
+            }
+            if (x != y && pos < end) {
+                unsigned int atom1 = x*TILE_SIZE + tgx;
+                AtomData2 data = loadAtomData2(atom1, posq, labFrameDipole, labFrameQuadrupole, inducedDipole, inducedDipolePolar, bornRadii);
                 data.force = make_real3(0);
                 data.bornForce = 0;
+                unsigned int j = y*TILE_SIZE + tgx;
+                localData[LOCAL_ID] = loadAtomData2(j, posq, labFrameDipole, labFrameQuadrupole, inducedDipole, inducedDipolePolar, bornRadii);
                 localData[LOCAL_ID].force = make_real3(0);
                 localData[LOCAL_ID].bornForce = 0;
                 SYNC_WARPS;
+                unsigned int tj = tgx;
+                for (j = 0; j < TILE_SIZE; j++) {
+                    int atom2 = y*TILE_SIZE+tj;
+                    if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
+                        real3 tempTorque;
+                        computeOneInteractionT1(&localData[tbx+tj], &data, &tempTorque, (GLOBAL const float*) torqueBuffers);
+                        computeOneInteractionT2(&localData[tbx+tj], &data, &tempTorque, (GLOBAL const float*) torqueBuffers);
+                        localData[tbx+tj].force += tempTorque;
+                    }
+                    tj = (tj + 1) & (TILE_SIZE - 1);
+                    SYNC_WARPS;
+                }
+                unsigned int offset = y*TILE_SIZE + tgx;
+                ATOMIC_ADD(&torqueBuffers[offset], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].force.x));
+                ATOMIC_ADD(&torqueBuffers[offset+PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].force.y));
+                ATOMIC_ADD(&torqueBuffers[offset+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(localData[LOCAL_ID].force.z));
+            }
+        }
+        pos++;
+    } while (pos < end);
+}
+
+KERNEL void computeGKBornForces(
+        GLOBAL const real4* RESTRICT posq, unsigned int startTileIndex, unsigned int numTileIndices, GLOBAL const real* RESTRICT labFrameDipole,
+        GLOBAL const real* RESTRICT labFrameQuadrupole, GLOBAL const real* RESTRICT inducedDipole, GLOBAL const real* RESTRICT inducedDipolePolar,
+        GLOBAL const real* RESTRICT bornRadii, GLOBAL mm_ulong* RESTRICT bornForce) {
+    unsigned int totalWarps = (GLOBAL_SIZE)/TILE_SIZE;
+    unsigned int warp = (GLOBAL_ID)/TILE_SIZE;
+    const unsigned int numTiles = numTileIndices;
+    unsigned int pos = (unsigned int) (startTileIndex+warp*(mm_long)numTiles/totalWarps);
+    unsigned int end = (unsigned int) (startTileIndex+(warp+1)*(mm_long)numTiles/totalWarps);
+    LOCAL AtomData2 localData[GK_FORCE_THREAD_BLOCK_SIZE];
+    do {
+        const unsigned int tgx = LOCAL_ID & (TILE_SIZE-1);
+        const unsigned int tbx = LOCAL_ID - tgx;
+        int x, y;
+        if (pos < end) {
+            y = (int) floor(NUM_BLOCKS+0.5f-SQRT((NUM_BLOCKS+0.5f)*(NUM_BLOCKS+0.5f)-2*pos));
+            x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
+            if (x < y || x >= NUM_BLOCKS) {
+                y += (x < y ? -1 : 1);
+                x = (pos-y*NUM_BLOCKS+y*(y+1)/2);
+            }
+            unsigned int atom1 = x*TILE_SIZE + tgx;
+            AtomData2 data = loadAtomData2(atom1, posq, labFrameDipole, labFrameQuadrupole, inducedDipole, inducedDipolePolar, bornRadii);
+            data.force = make_real3(0);
+            data.bornForce = 0;
+            if (pos >= end)
+                ;
+            else if (x == y) {
+                localData[LOCAL_ID].pos = data.pos;
+                localData[LOCAL_ID].q = data.q;
+                localData[LOCAL_ID].dipole = data.dipole;
+                localData[LOCAL_ID].quadrupoleXX = data.quadrupoleXX;
+                localData[LOCAL_ID].quadrupoleXY = data.quadrupoleXY;
+                localData[LOCAL_ID].quadrupoleXZ = data.quadrupoleXZ;
+                localData[LOCAL_ID].quadrupoleYY = data.quadrupoleYY;
+                localData[LOCAL_ID].quadrupoleYZ = data.quadrupoleYZ;
+                localData[LOCAL_ID].quadrupoleZZ = data.quadrupoleZZ;
+                localData[LOCAL_ID].inducedDipole = data.inducedDipole;
+                localData[LOCAL_ID].inducedDipolePolar = data.inducedDipolePolar;
+                localData[LOCAL_ID].bornRadius = data.bornRadius;
+                localData[LOCAL_ID].bornForce = 0;
+                SYNC_WARPS;
+                for (unsigned int j = 0; j < TILE_SIZE; j++) {
+                    int atom2 = y*TILE_SIZE+j;
+                    if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
+                        real bornForce1 = 0, bornForce2 = 0;
+                        computeOneInteractionB1(&data, &localData[tbx+j], &bornForce1, &bornForce2, (GLOBAL const float*) bornForce);
+                        computeOneInteractionB2(&data, &localData[tbx+j], &bornForce1, &bornForce2, (GLOBAL const float*) bornForce);
+                        data.bornForce += bornForce1;
+                        // bornForce2 for the diagonal tile is captured by symmetry when atom2
+                        // processes the reverse interaction as its own bornForce1.
+                        // Writing to localData[tbx+j] here would be a race (all threads share
+                        // the same j per iteration) and the result is never flushed anyway.
+                    }
+                }
+                ATOMIC_ADD(&bornForce[atom1], (mm_ulong) realToFixedPoint(data.bornForce));
+            }
+            else {
+                unsigned int j = y*TILE_SIZE + tgx;
+                localData[LOCAL_ID] = loadAtomData2(j, posq, labFrameDipole, labFrameQuadrupole, inducedDipole, inducedDipolePolar, bornRadii);
+                localData[LOCAL_ID].force = make_real3(0);
+                localData[LOCAL_ID].bornForce = 0;
+                SYNC_WARPS;
+                unsigned int tj = tgx;
                 for (j = 0; j < TILE_SIZE; j++) {
                     int atom2 = y*TILE_SIZE+tj;
                     if (atom1 < NUM_ATOMS && atom2 < NUM_ATOMS) {
                         real bornForce1 = 0, bornForce2 = 0;
-                        computeOneInteractionB1B2(data, localData[tbx+tj], &bornForce1, &bornForce2);
+                        computeOneInteractionB1(&data, &localData[tbx+tj], &bornForce1, &bornForce2, (GLOBAL const float*) bornForce);
+                        computeOneInteractionB2(&data, &localData[tbx+tj], &bornForce1, &bornForce2, (GLOBAL const float*) bornForce);
                         data.bornForce += bornForce1;
                         localData[tbx+tj].bornForce += bornForce2;
                     }
@@ -578,7 +710,6 @@ KERNEL void computeGKForces(
         }
         pos++;
     } while (pos < end);
-    energyBuffer[GLOBAL_ID] += energy*0.5f;
 }
 
 
