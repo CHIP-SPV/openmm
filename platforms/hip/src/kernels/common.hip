@@ -16,14 +16,15 @@
 #define GROUP_ID blockIdx.x
 #define NUM_GROUPS gridDim.x
 #define SYNC_THREADS __syncthreads();
-#define SYNC_WARPS {__builtin_amdgcn_wave_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");}
+#define SYNC_WARPS __syncthreads(); 
+//#define SYNC_WARPS {__builtin_amdgcn_wave_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");}
 #define MEM_FENCE __threadfence_block();
 #define ATOMIC_ADD(dest, value) atomicAdd(dest, value)
 
 typedef long long mm_long;
 typedef unsigned long long mm_ulong;
 
-#define SUPPORTS_DOUBLE_PRECISION 1
+#define SUPPORTS_DOUBLE_PRECISION 0
 
 #ifdef USE_DOUBLE_PRECISION
 
