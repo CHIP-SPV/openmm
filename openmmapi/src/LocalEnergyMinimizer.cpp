@@ -115,13 +115,21 @@ static lbfgsfloatval_t evaluate(void *instance, const lbfgsfloatval_t *x, lbfgsf
         // The CUDA, OpenCL and HIP platforms accumulate forces in fixed point, so they
         // can't handle very large forces.  Check for problematic forces (very large,
         // infinite, or NaN) and if necessary recompute them on the CPU.
-
-        for (int i = 0; i < 3*numParticles; i++) {
-            if (!(fabs(g[i]) < 2e9)) {
-                energy = computeForcesAndEnergy(data->getCpuContext(), positions, g);
-                break;
+        // Also fall back to CPU when energy is unphysically large or non-finite:
+        // on some GPU platforms (e.g. Intel Arc via CHIP-SPV), fixed-point force
+        // overflow can wrap around to small values that bypass the per-component
+        // threshold check below, while the energy correctly reports as Inf/NaN/huge.
+        bool useCpu = !(energy < 1e15);
+        if (!useCpu) {
+            for (int i = 0; i < 3*numParticles; i++) {
+                if (!(fabs(g[i]) < 2e9)) {
+                    useCpu = true;
+                    break;
+                }
             }
         }
+        if (useCpu)
+            energy = computeForcesAndEnergy(data->getCpuContext(), positions, g);
     }
 
     // Add harmonic forces for any constraints.
