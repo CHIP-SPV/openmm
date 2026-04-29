@@ -54,11 +54,13 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <stack>
 #include <thread>
 #include <typeinfo>
+#include <unordered_map>
 #include <sys/stat.h>
 #include <hip/hiprtc.h>
 
@@ -217,6 +219,7 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
         compilationDefines["USE_INT64_ATOMIC_ADD_WORKAROUND"] = "1";
     // if (simdWidth == 32)
         // compilationDefines["AMD_RDNA"] = "1";
+
     if (useDoublePrecision) {
         posq.initialize<double4>(*this, paddedNumAtoms, "posq");
         velm.initialize<double4>(*this, paddedNumAtoms, "velm");
@@ -578,9 +581,33 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
 
     string cacheFile = getCacheFileName(src.str());
     hipModule_t module;
-    if (hipModuleLoad(&module, cacheFile.c_str()) == hipSuccess) {
-        loadedModules.push_back(module);
-        return module;
+
+    // In-process module cache: skip recompilation if the same source (keyed by
+    // content hash + GPU architecture) was already compiled in this process.
+    // Cached modules are shared across contexts and never unloaded individually;
+    // they persist until the process exits.
+    static std::unordered_map<std::string, hipModule_t> inProcessModuleCache;
+    {
+        auto it = inProcessModuleCache.find(cacheFile);
+        if (it != inProcessModuleCache.end())
+            return it->second;
+    }
+
+    // Try to load from the on-disk cache (written by a previous run).
+    // Re-using the same SPIR-V binary avoids triggering a fresh IGC JIT that
+    // may reorder floating-point operations, which would make results non-deterministic.
+    {
+        ifstream cacheIn(cacheFile.c_str(), ios::in | ios::binary);
+        if (cacheIn.good()) {
+            vector<char> cachedCode((istreambuf_iterator<char>(cacheIn)), istreambuf_iterator<char>());
+            if (!cachedCode.empty()) {
+                hipError_t loadErr = hipModuleLoadDataEx(&module, cachedCode.data(), 0, NULL, NULL);
+                if (loadErr == hipSuccess) {
+                    inProcessModuleCache[cacheFile] = module;
+                    return module;
+                }
+            }
+        }
     }
 
     // Select names for the various temporary files.
@@ -653,7 +680,7 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
             // Ignore.
         }
         CHECK_RESULT2(hipModuleLoadDataEx(&module, &code[0], 0, NULL, NULL), "Error loading HIP module");
-        loadedModules.push_back(module);
+        inProcessModuleCache[cacheFile] = module;
         return module;
     }
     catch (...) {
