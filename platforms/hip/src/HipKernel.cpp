@@ -44,6 +44,8 @@ string HipKernel::getName() const {
 int HipKernel::getMaxBlockSize() const {
     int size;
     hipError_t result = hipFuncGetAttribute(&size, HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, kernel);
+    if (result == hipErrorNotSupported)
+        return context.getMaxThreadBlockSize();
     if (result != hipSuccess)
         throw OpenMMException("Error querying max thread block size: "+context.getErrorString(result));
     return size;
