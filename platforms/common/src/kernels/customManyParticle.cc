@@ -7,6 +7,8 @@ inline DEVICE void storeForce(int atom, real3 force, GLOBAL mm_ulong* RESTRICT f
     ATOMIC_ADD(&forceBuffers[atom+2*PADDED_NUM_ATOMS], (mm_ulong) realToFixedPoint(force.z));
 }
 
+FUNCTION_DEFINITIONS
+
 /**
  * Compute the difference between two vectors, taking periodic boundary conditions into account
  * and setting the fourth component to the squared magnitude.
@@ -44,7 +46,11 @@ inline DEVICE bool isInteractionExcluded(int atom1, int atom2, GLOBAL const int*
 /**
  * Compute the interaction.
  */
+#ifdef FORCE_WORKGROUP_SIZE
+KERNEL __launch_bounds__(FORCE_WORKGROUP_SIZE) void computeInteraction(
+#else
 KERNEL void computeInteraction(
+#endif
         GLOBAL mm_ulong* RESTRICT forceBuffers, GLOBAL mixed* RESTRICT energyBuffer, GLOBAL const real4* RESTRICT posq,
         real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ
 #ifdef USE_CUTOFF
@@ -105,6 +111,19 @@ KERNEL void computeInteraction(
     }
     energyBuffer[GLOBAL_ID] += energy;
 }
+
+// IGC on Intel GPU miscompiles the block min-distance check when inlined into findNeighbors.
+// Wrapping it in a noinline device helper keeps it as a separate SPIR-V function and
+// prevents the miscompilation (same pattern as interp3D_tricubic_eval in vectorOps.hip).
+#ifdef USE_HIP
+static __device__ __attribute__((noinline))
+bool blockDistLessThanCutoff(real4 blockDelta, real4 blockSize1, real4 blockSize2) {
+    blockDelta.x = max((real) 0, fabs(blockDelta.x)-blockSize1.x-blockSize2.x);
+    blockDelta.y = max((real) 0, fabs(blockDelta.y)-blockSize1.y-blockSize2.y);
+    blockDelta.z = max((real) 0, fabs(blockDelta.z)-blockSize1.z-blockSize2.z);
+    return blockDelta.x*blockDelta.x + blockDelta.y*blockDelta.y + blockDelta.z*blockDelta.z < CUTOFF_SQUARED;
+}
+#endif
 
 /**
  * Find a bounding box for the atoms in each block.
@@ -183,10 +202,14 @@ KERNEL void findNeighbors(real4 periodicBoxSize, real4 invPeriodicBoxSize, real4
 #ifdef USE_PERIODIC
                 APPLY_PERIODIC_TO_DELTA(blockDelta)
 #endif
+#ifdef USE_HIP
+                includeBlock2 &= blockDistLessThanCutoff(blockDelta, blockSize1, blockSize2);
+#else
                 blockDelta.x = max((real) 0, fabs(blockDelta.x)-blockSize1.x-blockSize2.x);
                 blockDelta.y = max((real) 0, fabs(blockDelta.y)-blockSize1.y-blockSize2.y);
                 blockDelta.z = max((real) 0, fabs(blockDelta.z)-blockSize1.z-blockSize2.z);
                 includeBlock2 &= (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < CUTOFF_SQUARED);
+#endif
             }
             
             // Loop over any blocks we identified as potentially containing neighbors.

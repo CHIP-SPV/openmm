@@ -4465,7 +4465,7 @@ double CommonCalcCustomHbondForceKernel::execute(ContextImpl& context, bool incl
     setPeriodicBoxArgs(cc, forceKernel, 6);
     int numDonorBlocks = (numDonors+31)/32;
     int numAcceptorBlocks = (numAcceptors+31)/32;
-    forceKernel->execute(numDonorBlocks*numAcceptorBlocks*32, cc.getSIMDWidth() < 32 ? 32 : 128);
+    forceKernel->execute(numDonorBlocks*numAcceptorBlocks*32, cc.getSIMDWidth() <= 32 ? 32 : 128);
     return 0.0;
 }
 
@@ -4571,8 +4571,8 @@ void CommonCalcCustomManyParticleForceKernel::initialize(const System& system, c
     int particlesPerSet = force.getNumParticlesPerSet();
     bool centralParticleMode = (force.getPermutationMode() == CustomManyParticleForce::UniqueCentralParticle);
     nonbondedMethod = CalcCustomManyParticleForceKernel::NonbondedMethod(force.getNonbondedMethod());
-    forceWorkgroupSize = 128;
-    findNeighborsWorkgroupSize = (cc.getSIMDWidth() >= 32 ? 128 : 32);
+    forceWorkgroupSize = (cc.getSIMDWidth() > 32 ? 128 : 32);
+    findNeighborsWorkgroupSize = (cc.getSIMDWidth() > 32 ? 128 : 32);
     
     // Record parameter values.
     
@@ -4595,6 +4595,7 @@ void CommonCalcCustomManyParticleForceKernel::initialize(const System& system, c
     map<string, Lepton::CustomFunction*> functions;
     vector<pair<string, string> > functionDefinitions;
     vector<const TabulatedFunction*> functionList;
+    vector<int> tableWidths;
     stringstream tableArgs;
     tabulatedFunctionArrays.resize(force.getNumTabulatedFunctions());
     for (int i = 0; i < force.getNumTabulatedFunctions(); i++) {
@@ -4606,6 +4607,7 @@ void CommonCalcCustomManyParticleForceKernel::initialize(const System& system, c
         functions[name] = cc.getExpressionUtilities().getFunctionPlaceholder(force.getTabulatedFunction(i));
         int width;
         vector<float> f = cc.getExpressionUtilities().computeFunctionCoefficients(force.getTabulatedFunction(i), width);
+        tableWidths.push_back(width);
         tabulatedFunctionArrays[i].initialize<float>(cc, f.size(), "TabulatedFunction");
         tabulatedFunctionArrays[i].upload(f);
         tableArgs << ", GLOBAL const float";
@@ -4613,7 +4615,7 @@ void CommonCalcCustomManyParticleForceKernel::initialize(const System& system, c
             tableArgs << width;
         tableArgs << "* RESTRICT " << arrayName;
     }
-    
+
     // Record information about parameters.
 
     globalParamNames.resize(force.getNumGlobalParameters());
@@ -4714,18 +4716,15 @@ void CommonCalcCustomManyParticleForceKernel::initialize(const System& system, c
 
     Lepton::ParsedExpression energyExpression = CustomManyParticleForceImpl::prepareExpression(force, functions);
     map<string, Lepton::ParsedExpression> forceExpressions;
-    stringstream compute;
-    for (int i = 0; i < (int) params->getParameterInfos().size(); i++) {
-        ComputeParameterInfo& parameter = params->getParameterInfos()[i];
-        compute<<parameter.getType()<<" params"<<(i+1)<<" = global_params"<<(i+1)<<"[index];\n";
-    }
+    // Build the expression body (force declarations + Lepton code, without storeForce).
+    stringstream computeBody;
     forceExpressions["energy += "] = energyExpression;
     vector<string> forceNames;
     for (int i = 0; i < particlesPerSet; i++) {
         string istr = cc.intToString(i+1);
         string forceName = "force"+istr;
         forceNames.push_back(forceName);
-        compute<<"real3 "<<forceName<<" = make_real3(0);\n";
+        computeBody<<"real3 "<<forceName<<" = make_real3(0);\n";
         Lepton::ParsedExpression forceExpressionX = energyExpression.differentiate("x"+istr).optimize();
         Lepton::ParsedExpression forceExpressionY = energyExpression.differentiate("y"+istr).optimize();
         Lepton::ParsedExpression forceExpressionZ = energyExpression.differentiate("z"+istr).optimize();
@@ -4736,12 +4735,79 @@ void CommonCalcCustomManyParticleForceKernel::initialize(const System& system, c
         if (!isZeroExpression(forceExpressionZ))
             forceExpressions[forceName+".z -= "] = forceExpressionZ;
     }
-    compute << cc.getExpressionUtilities().createExpressions(forceExpressions, variables, functionList, functionDefinitions, "temp", "real", force.usesPeriodicBoundaryConditions());
-    
-    // Store forces to global memory.
-    
+    computeBody << cc.getExpressionUtilities().createExpressions(forceExpressions, variables, functionList, functionDefinitions, "temp", "real", force.usesPeriodicBoundaryConditions());
+
+    // Wrap the force body in a noinline device helper to reduce register pressure in the
+    // computeInteraction kernel.  IGC (Intel GPU) drops kernels that exceed the register
+    // budget via RetryManager; moving the body here lets IGC compile each part separately.
+    //
+    // IMPORTANT: The helper must NOT use Function-storage-class pointer output parameters
+    // (i.e., no "real3* outForce" pointing to the caller's stack).  The LLVM SPIR-V backend
+    // silently inlines calls that require Function-class pointer arguments, defeating noinline.
+    // Instead, the helper accepts atom indices and the global forceBuffers pointer (CrossWorkgroup
+    // storage class), calls storeForce internally, and returns energy by scalar value.
+    stringstream helperDef;
+    // Non-static (external linkage) prevents LLVM dead-argument elimination from removing
+    // the 'globals' CrossWorkgroup pointer parameter, which is needed to keep this function
+    // as a separate SPIR-V OpFunction (LLVM SPIR-V backend inlines functions that have only
+    // Function-class pointer or scalar parameters with no CrossWorkgroup input pointer).
+    helperDef << "DEVICE __attribute__((noinline)) mixed _computeInteractionHelper(";
     for (int i = 0; i < particlesPerSet; i++)
-        compute<<"storeForce(atom"<<(i+1)<<", "<<forceNames[i]<<", forceBuffers);\n";
+        helperDef << "int atom" << cc.intToString(i+1) << ", ";
+    // Pass positions as scalar components to avoid Function-class struct pointer params,
+    // which cause LLVM's SPIR-V backend to silently inline the function despite noinline.
+    for (int i = 0; i < particlesPerSet; i++) {
+        string n = cc.intToString(i+1);
+        helperDef << "real pos" << n << "x, real pos" << n << "y, real pos" << n << "z, ";
+    }
+    for (int j = 0; j < (int)params->getParameterInfos().size(); j++) {
+        const string& ptype = params->getParameterInfos()[j].getType();
+        for (int i = 0; i < particlesPerSet; i++)
+            helperDef << ptype << " params" << cc.intToString(j+1) << cc.intToString(i+1) << ", ";
+    }
+    // Always include globals pointer — its CrossWorkgroup storage class prevents the LLVM
+    // SPIR-V backend from inlining this function even when there are no actual global params.
+    helperDef << "GLOBAL const float* globals, ";
+    for (int i = 0; i < force.getNumTabulatedFunctions(); i++) {
+        helperDef << "const float";
+        if (tableWidths[i] > 1)
+            helperDef << cc.intToString(tableWidths[i]);
+        helperDef << "* RESTRICT table" << cc.intToString(i) << ", ";
+    }
+    if (force.usesPeriodicBoundaryConditions())
+        helperDef << "real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ, ";
+    helperDef << "GLOBAL mm_ulong* RESTRICT forceBuffers) {\n";
+    helperDef << "mixed energy = 0;\n";
+    for (int i = 0; i < particlesPerSet; i++) {
+        string n = cc.intToString(i+1);
+        helperDef << "real3 pos" << n << " = make_real3(pos" << n << "x, pos" << n << "y, pos" << n << "z);\n";
+    }
+    helperDef << computeBody.str();
+    for (int i = 0; i < particlesPerSet; i++)
+        helperDef << "storeForce(atom" << cc.intToString(i+1) << ", " << forceNames[i] << ", forceBuffers);\n";
+    helperDef << "return energy;\n";
+    helperDef << "}\n";
+
+    // Build COMPUTE_INTERACTION: call the helper, which stores forces and returns energy.
+    stringstream compute;
+    compute << "{\n";
+    compute << "energy += _computeInteractionHelper(";
+    for (int i = 0; i < particlesPerSet; i++)
+        compute << "atom" << cc.intToString(i+1) << ", ";
+    for (int i = 0; i < particlesPerSet; i++) {
+        string n = cc.intToString(i+1);
+        compute << "pos" << n << ".x, pos" << n << ".y, pos" << n << ".z, ";
+    }
+    for (int j = 0; j < (int)params->getParameterInfos().size(); j++)
+        for (int i = 0; i < particlesPerSet; i++)
+            compute << "params" << cc.intToString(j+1) << cc.intToString(i+1) << ", ";
+    compute << (force.getNumGlobalParameters() > 0 ? "globals, " : "(GLOBAL const float*) 0, ");
+    for (int i = 0; i < force.getNumTabulatedFunctions(); i++)
+        compute << "table" << cc.intToString(i) << ", ";
+    if (force.usesPeriodicBoundaryConditions())
+        compute << "periodicBoxSize, invPeriodicBoxSize, periodicBoxVecX, periodicBoxVecY, periodicBoxVecZ, ";
+    compute << "forceBuffers);\n";
+    compute << "}\n";
     
     // Create other replacements that depend on the number of particles per set.
     
@@ -4844,6 +4910,7 @@ void CommonCalcCustomManyParticleForceKernel::initialize(const System& system, c
 
     map<string, string> replacements;
     replacements["COMPUTE_INTERACTION"] = compute.str();
+    replacements["FUNCTION_DEFINITIONS"] = helperDef.str();
     replacements["NUM_CANDIDATE_COMBINATIONS"] = numCombinations.str();
     replacements["FIND_ATOMS_FOR_COMBINATION_INDEX"] = atomsForCombination.str();
     replacements["IS_VALID_COMBINATION"] = isValidCombination.str();
@@ -4871,6 +4938,7 @@ void CommonCalcCustomManyParticleForceKernel::initialize(const System& system, c
     defines["TILE_SIZE"] = cc.intToString(32);
     defines["NUM_BLOCKS"] = cc.intToString(numAtomBlocks);
     defines["FIND_NEIGHBORS_WORKGROUP_SIZE"] = cc.intToString(findNeighborsWorkgroupSize);
+    defines["FORCE_WORKGROUP_SIZE"] = cc.intToString(forceWorkgroupSize);
     ComputeProgram program = cc.compileProgram(cc.replaceStrings(CommonKernelSources::pointFunctions+CommonKernelSources::customManyParticle, replacements), defines);
     forceKernel = program->createKernel("computeInteraction");
     blockBoundsKernel = program->createKernel("findBlockBounds");
