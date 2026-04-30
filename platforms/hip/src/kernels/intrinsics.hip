@@ -13,6 +13,16 @@
 #endif
 #endif
 
+#ifdef USE_SLM_SHFL
+// File-scope SLM scratch shared by all warpShuffle<T> instantiations.
+// Without this (declaring __shared__ inside the template), each template
+// instantiation gets its own array, multiplying SLM usage by the number of
+// distinct T types passed. On Arc that drives the workgroup over the
+// per-Xe-core SLM budget and tanks occupancy; observable as slm_size jumping
+// from ~32 B to ~4 KB in the kernel zeinfo.
+static __device__ __shared__ int slm_shfl_scratch[256];
+#endif
+
 template<class T>
 static __inline__ __device__
 T warpShuffle(const T& input, const int src_lane) {
@@ -25,15 +35,14 @@ T warpShuffle(const T& input, const int src_lane) {
         int word;
         __builtin_memcpy(&word, reinterpret_cast<const char*>(&input) + i * sizeof(int), sizeof(int));
 #ifdef USE_SLM_SHFL
-        // SLM-backed shuffle for chipStar on Intel: subgroup shuffle (OpSubgroupShuffleINTEL)
-        // compiles to slower GenISA on Xe-HPC than SLM reads via block-load patterns. Each
-        // warp gets its own warpSize-entry slot in shared scratch. Sized for the largest
-        // workgroup any HIP kernel uses (256), to keep this header self-contained.
-        __shared__ int slm_shfl[256];
-        slm_shfl[threadIdx.x] = word;
+        // SLM-backed shuffle for chipStar on Intel: subgroup shuffle
+        // (OpSubgroupShuffleINTEL) compiles to slower GenISA on Xe-HPC than
+        // SLM reads via block-load patterns. Single file-scope scratch is
+        // shared across all template instantiations to keep occupancy.
+        slm_shfl_scratch[threadIdx.x] = word;
         __syncwarp();
         const unsigned int warp_base = threadIdx.x & ~(warpSize - 1);
-        word = slm_shfl[warp_base + (src_lane & (warpSize - 1))];
+        word = slm_shfl_scratch[warp_base + (src_lane & (warpSize - 1))];
 #else
         word = __shfl(word, src_lane & (warpSize - 1));
 #endif
