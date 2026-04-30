@@ -72,11 +72,14 @@ HipNonbondedUtilities::HipNonbondedUtilities(HipContext& context) : context(cont
     // Intel Arc GPUs have a tight per-workgroup private memory limit (~128KB).
     // Large kernels like computeBornSum use ~2340B/thread via IGC stack calls,
     // so 64 threads/workgroup = ~149KB which exceeds the limit. Use 32 instead.
+    // PVC (Data Center GPU Max) has a much larger per-WG private memory budget
+    // and benefits from 128 threads/WG (msinclair-py/openmm-sycl tuning).
     {
         hipDeviceProp_t props;
         hipGetDeviceProperties(&props, context.getDevice());
         bool isIntelGPU = (std::string(props.name).find("Intel") != std::string::npos);
-        forceThreadBlockSize = isIntelGPU ? 32 : 64;
+        bool isPVC = isIntelGPU && (std::string(props.name).find("Data Center GPU Max") != std::string::npos);
+        forceThreadBlockSize = isPVC ? 128 : (isIntelGPU ? 32 : 64);
     }
     // Cap to avoid energyBuffer out-of-bounds in energy accumulation
     int maxForceBlocks = context.getNumThreadBlocks() * HipContext::ThreadBlockSize / forceThreadBlockSize;
