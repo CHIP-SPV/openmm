@@ -218,7 +218,14 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
     numThreadBlocks = numThreadBlocksPerComputeUnit*multiprocessors;
 
     compilationDefines["USE_HIP"] = "1";
-    if (isIntelGPU)
+    // Intel atomicAdd workaround. The IGC SubgroupSize-32 lowering bug
+    // (intel/intel-graphics-compiler#397) makes OpAtomicIAdd fire 4x per call
+    // on Arc Xe-HPG. Empirically, PVC (Xe-HPC) does not exhibit the bug —
+    // testInstallation forces match Reference within tolerance and benchmark
+    // perf jumps 20-35% when the workaround is disabled. Restrict to non-PVC
+    // Intel devices. OPENMM_HIP_DISABLE_CAS_WORKAROUND forces it off entirely.
+    bool isPVCgpu = isIntelGPU && (string(props.name).find("Data Center GPU Max") != string::npos);
+    if (isIntelGPU && !isPVCgpu && getenv("OPENMM_HIP_DISABLE_CAS_WORKAROUND") == nullptr)
         compilationDefines["USE_INT64_ATOMIC_ADD_WORKAROUND"] = "1";
     // if (simdWidth == 32)
         // compilationDefines["AMD_RDNA"] = "1";
