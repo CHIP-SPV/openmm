@@ -205,6 +205,7 @@ HipFFT3D::HipFFT3D(HipContext& context, int xsize, int ysize, int zsize, bool re
     // producing non-deterministic results that prevent DIIS convergence. The CPU implementation
     // is deterministic. Only enabled for single precision (double is broken on Intel Arc anyway).
     bool intelGPU = !context.getSupportsHardwareFloatGlobalAtomicAdd();
+    if (getenv("OPENMM_HIP_FFT_FORCE_GPU") != nullptr) intelGPU = false;
     if (intelGPU && !context.getUseDoublePrecision()) {
         cpuFallback = true;
         app = nullptr;
