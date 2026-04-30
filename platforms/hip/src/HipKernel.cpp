@@ -60,6 +60,13 @@ void HipKernel::execute(int threads, int blockSize) {
         else
             argPointers[i] = &primitiveArgs[i];
     }
+    // Intel GPU: override default block size for kernels that benefit from
+    // wider workgroups. computeBondedForces in particular is launched via
+    // BondedUtilities with no explicit blockSize and runs ~7x slower than the
+    // OpenCL reference at the AMD-default 64 thr/WG. PVC's 128 KB private-mem
+    // budget per WG accommodates this kernel at 128 thr/WG.
+    if (blockSize == -1 && context.getIsIntelGPU() && name == "computeBondedForces")
+        blockSize = 96;
     context.executeKernel(kernel, argPointers.data(), threads, blockSize);
 }
 

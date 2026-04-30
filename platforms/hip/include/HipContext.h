@@ -426,6 +426,13 @@ public:
         return supportsHardwareFloatGlobalAtomicAdd;
     }
     /**
+     * Get whether the device being used is an Intel GPU (running via chipStar).
+     * Used for vendor-specific launch tuning (workgroup sizes, atomic workarounds).
+     */
+    bool getIsIntelGPU() const {
+        return isIntelGPU;
+    }
+    /**
      * Get whether the device being used supports double precision math.
      */
     bool getSupportsDoublePrecision() const {
