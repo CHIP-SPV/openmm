@@ -24,11 +24,19 @@ T warpShuffle(const T& input, const int src_lane) {
     for(int i = 0; i < words_no; i++) {
         int word;
         __builtin_memcpy(&word, reinterpret_cast<const char*>(&input) + i * sizeof(int), sizeof(int));
-        // #ifdef __HIP_PLATFORM_AMD__
-        // word = __builtin_amdgcn_ds_bpermute(src_lane << 2, word);
-        // #else
+#ifdef USE_SLM_SHFL
+        // SLM-backed shuffle for chipStar on Intel: subgroup shuffle (OpSubgroupShuffleINTEL)
+        // compiles to slower GenISA on Xe-HPC than SLM reads via block-load patterns. Each
+        // warp gets its own warpSize-entry slot in shared scratch. Sized for the largest
+        // workgroup any HIP kernel uses (256), to keep this header self-contained.
+        __shared__ int slm_shfl[256];
+        slm_shfl[threadIdx.x] = word;
+        __syncwarp();
+        const unsigned int warp_base = threadIdx.x & ~(warpSize - 1);
+        word = slm_shfl[warp_base + (src_lane & (warpSize - 1))];
+#else
         word = __shfl(word, src_lane & (warpSize - 1));
-        // #endif
+#endif
         __builtin_memcpy(reinterpret_cast<char*>(&output) + i * sizeof(int), &word, sizeof(int));
     }
 

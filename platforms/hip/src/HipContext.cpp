@@ -227,6 +227,11 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
     bool isPVCgpu = isIntelGPU && (string(props.name).find("Data Center GPU Max") != string::npos);
     if (isIntelGPU && !isPVCgpu && getenv("OPENMM_HIP_DISABLE_CAS_WORKAROUND") == nullptr)
         compilationDefines["USE_INT64_ATOMIC_ADD_WORKAROUND"] = "1";
+    // PVC-only: replace warp shuffle with SLM-backed scratch in warpShuffle().
+    // chipStar lowers __shfl to OpSubgroupShuffleINTEL, which on Xe-HPC compiles
+    // to slower GenISA than SLM reads. Off by default on Arc Xe-HPG.
+    if (isPVCgpu && getenv("OPENMM_HIP_DISABLE_SLM_SHFL") == nullptr)
+        compilationDefines["USE_SLM_SHFL"] = "1";
     // if (simdWidth == 32)
         // compilationDefines["AMD_RDNA"] = "1";
 
