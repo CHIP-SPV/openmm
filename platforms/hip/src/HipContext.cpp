@@ -171,8 +171,11 @@ HipContext::HipContext(const System& system, int deviceIndex, bool useBlockingSy
 
     // gpuArchitecture = props.gcnArchName;
     gpuArchitecture = "";
-    // HIP-TODO: find a good value here
-    int numThreadBlocksPerComputeUnit = 6;
+    // HIP-TODO: find a good value here.
+    // Intel GPUs via chipStar: 4 to give numForceThreadBlocks = 2*VE after the
+    // maxForceBlocks cap, matching the msinclair-py/openmm-sycl OpenCL fork's
+    // PVC tuning (blocksPerComputeUnit=2). AMD path keeps 6.
+    int numThreadBlocksPerComputeUnit = (string(props.name).find("Intel") != string::npos) ? 4 : 6;
 
     // GPUs starting from CDNA1 and RDNA3 support atomic add for floats (global_atomic_add_f32),
     // which can be used in PME. Older GPUs use fixed point charge spreading instead.
