@@ -79,7 +79,11 @@ HipNonbondedUtilities::HipNonbondedUtilities(HipContext& context) : context(cont
         hipGetDeviceProperties(&props, context.getDevice());
         bool isIntelGPU = (std::string(props.name).find("Intel") != std::string::npos);
         bool isPVC = isIntelGPU && (std::string(props.name).find("Data Center GPU Max") != std::string::npos);
-        forceThreadBlockSize = isPVC ? 128 : (isIntelGPU ? 32 : 64);
+        // OPENMM_HIP_DISABLE_INTEL_TUNING reverts to AMD-default 64 for A/B
+        // testing the contribution of launch-parameter tuning.
+        bool disableTuning = (getenv("OPENMM_HIP_DISABLE_INTEL_TUNING") != nullptr);
+        forceThreadBlockSize = (!disableTuning && isPVC) ? 128 :
+                               (!disableTuning && isIntelGPU) ? 32 : 64;
     }
     // Cap to avoid energyBuffer out-of-bounds in energy accumulation
     int maxForceBlocks = context.getNumThreadBlocks() * HipContext::ThreadBlockSize / forceThreadBlockSize;

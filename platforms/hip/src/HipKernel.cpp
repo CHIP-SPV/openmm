@@ -65,7 +65,9 @@ void HipKernel::execute(int threads, int blockSize) {
     // BondedUtilities with no explicit blockSize and runs ~7x slower than the
     // OpenCL reference at the AMD-default 64 thr/WG. PVC's 128 KB private-mem
     // budget per WG accommodates this kernel at 128 thr/WG.
-    if (blockSize == -1 && context.getIsIntelGPU() && name == "computeBondedForces")
+    // OPENMM_HIP_DISABLE_INTEL_TUNING skips this for A/B testing.
+    if (blockSize == -1 && context.getIsIntelGPU() && name == "computeBondedForces"
+        && getenv("OPENMM_HIP_DISABLE_INTEL_TUNING") == nullptr)
         blockSize = 96;
     context.executeKernel(kernel, argPointers.data(), threads, blockSize);
 }
