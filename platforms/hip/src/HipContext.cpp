@@ -528,7 +528,7 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
     int runtimeVersion;
     CHECK_RESULT2(hipRuntimeGetVersion(&runtimeVersion), "Error getting HIP runtime version");
 
-    string options = "-O3 -Wall -Wno-hip-only";
+    string options = "-O3 -ffast-math -munsafe-fp-atomics -Wall -Wno-hip-only";
     options += " --offload-arch=" + gpuArchitecture;
     if (gpuArchitecture.find("gfx90a") == 0 ||
         gpuArchitecture.find("gfx94") == 0) {
