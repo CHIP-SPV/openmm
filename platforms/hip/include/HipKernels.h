@@ -36,6 +36,9 @@
 #include "openmm/kernels.h"
 #include "openmm/System.h"
 #include "openmm/common/CommonKernels.h"
+#ifdef OPENMM_HIP_WITH_HIPFFT
+#include <hipfft.h>
+#endif
 
 namespace OpenMM {
 
@@ -189,6 +192,12 @@ private:
     hipEvent_t pmeSyncEvent, paramsSyncEvent;
     HipFFT3D* fft;
     HipFFT3D* dispersionFft;
+#ifdef OPENMM_HIP_WITH_HIPFFT
+    hipfftHandle fftForward;
+    hipfftHandle fftBackward;
+    hipfftHandle dispersionFftForward;
+    hipfftHandle dispersionFftBackward;
+#endif
     hipFunction_t computeParamsKernel, computeExclusionParamsKernel;
     hipFunction_t ewaldSumsKernel;
     hipFunction_t ewaldForcesKernel;
@@ -212,7 +221,7 @@ private:
     int interpolateForceThreads;
     int gridSizeX, gridSizeY, gridSizeZ;
     int dispersionGridSizeX, dispersionGridSizeY, dispersionGridSizeZ;
-    bool hasCoulomb, hasLJ, useFixedPointChargeSpreading, usePmeStream, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
+    bool hasCoulomb, hasLJ, useFixedPointChargeSpreading, usePmeStream, useHipFFT, doLJPME, usePosqCharges, recomputeParams, hasOffsets;
     NonbondedMethod nonbondedMethod;
     static const int PmeOrder = 5;
 };

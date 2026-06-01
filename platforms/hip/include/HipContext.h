@@ -183,10 +183,6 @@ public:
      */
     ComputeEvent createEvent();
     /**
-     * Get the smallest legal size for a dimension of the grid supported by the FFT.
-     */
-    virtual int findLegalFFTDimension(int minimum);
-    /**
      * Compile source code to create a ComputeProgram.
      *
      * @param source             the source code of the program

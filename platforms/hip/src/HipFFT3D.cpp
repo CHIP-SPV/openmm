@@ -7,8 +7,8 @@
  * Medical Research, grant U54 GM072970. See https://simtk.org.               *
  *                                                                            *
  * Portions copyright (c) 2009-2015 Stanford University and the Authors.      *
- * Portions copyright (c) 2021 Advanced Micro Devices, Inc.                   *
- * Authors:                                                                   *
+ * Portions copyright (c) 2020 Advanced Micro Devices, Inc.                   *
+ * Authors: Peter Eastman, Nicholas Curtis                                    *
  * Contributors:                                                              *
  *                                                                            *
  * This program is free software: you can redistribute it and/or modify       *
@@ -27,330 +27,101 @@
 
 #include "HipFFT3D.h"
 #include "HipContext.h"
-#include <fstream>
-#include <iostream>
+#include "HipKernelSources.h"
+#include "SimTKOpenMMRealType.h"
+#include <map>
 #include <sstream>
-#include <iterator>
-#include <complex>
-#include <cmath>
-#include <vector>
+#include <string>
 
 using namespace OpenMM;
 using namespace std;
 
-// ============================================================
-// CPU FFT fallback for Intel Arc via chipStar/CHIP-SPV.
-// VkFFT generates GPU kernels compiled by IGC, whose JIT
-// optimizations reorder floating-point operations between runs,
-// producing non-deterministic results. The CPU implementation
-// below uses a general mixed-radix Cooley-Tukey algorithm and
-// is exact (deterministic) for any grid size with factors ≤ 7.
-// ============================================================
-
-using cfloat = complex<float>;
-
-// In-place 1D FFT: general mixed-radix, forward (inverse=false) or inverse (inverse=true).
-// Unnormalized: the inverse does not divide by N.
-static void fft1d_cpu(cfloat* data, int n, bool inverse) {
-    if (n <= 1) return;
-    const float sign = inverse ? 1.0f : -1.0f;
-    // Find smallest prime factor of n.
-    int p = 2;
-    while (n % p != 0) p++;
-    const int m = n / p; // n = p * m
-
-    // Collect p sub-arrays of size m: G[s][j] = data[j*p + s].
-    vector<cfloat> G(n);
-    for (int s = 0; s < p; s++) {
-        for (int j = 0; j < m; j++)
-            G[s*m + j] = data[j*p + s];
-        fft1d_cpu(G.data() + s*m, m, inverse);
-    }
-    // Combine: X[k] = sum_{s=0}^{p-1} W_n^{sk} * G_s[k mod m]
-    // where W_n = exp(sign * 2*pi*i / n).
-    const float c = sign * 2.0f * static_cast<float>(M_PI) / n;
-    for (int k = 0; k < n; k++) {
-        cfloat val(0.0f, 0.0f);
-        const int q = k % m;
-        for (int s = 0; s < p; s++) {
-            const float angle = c * static_cast<float>(s * k);
-            val += cfloat(cosf(angle), sinf(angle)) * G[s*m + q];
-        }
-        data[k] = val;
-    }
-}
-
-// 3D R2C forward FFT: real[nx][ny][nz] → complex[nx][ny][nz/2+1].
-// Both arrays are laid out with z as the fastest-varying index.
-static void fft3d_r2c_cpu(const float* in_r, cfloat* out_c, int nx, int ny, int nz) {
-    const int nzout = nz / 2 + 1;
-    vector<cfloat> work(nx * ny * nz);
-    for (int i = 0; i < nx*ny*nz; i++)
-        work[i] = cfloat(in_r[i], 0.0f);
-
-    // FFT along z for each (x, y).
-    for (int xy = 0; xy < nx*ny; xy++)
-        fft1d_cpu(work.data() + xy*nz, nz, false);
-
-    // FFT along y for each (x, z).
-    vector<cfloat> row(ny);
-    for (int x = 0; x < nx; x++) {
-        for (int z = 0; z < nz; z++) {
-            for (int y = 0; y < ny; y++) row[y] = work[(x*ny+y)*nz+z];
-            fft1d_cpu(row.data(), ny, false);
-            for (int y = 0; y < ny; y++) work[(x*ny+y)*nz+z] = row[y];
-        }
-    }
-
-    // FFT along x for each (y, z).
-    vector<cfloat> col(nx);
-    for (int y = 0; y < ny; y++) {
-        for (int z = 0; z < nz; z++) {
-            for (int x = 0; x < nx; x++) col[x] = work[(x*ny+y)*nz+z];
-            fft1d_cpu(col.data(), nx, false);
-            for (int x = 0; x < nx; x++) work[(x*ny+y)*nz+z] = col[x];
-        }
-    }
-
-    // Copy the non-redundant z slice to output.
-    for (int xy = 0; xy < nx*ny; xy++)
-        for (int z = 0; z < nzout; z++)
-            out_c[xy*nzout+z] = work[xy*nz+z];
-}
-
-// 3D C2R inverse FFT: complex[nx][ny][nz/2+1] → real[nx][ny][nz].
-// Inverse transforms along x and y first; C2R along z last (preserves
-// the Hermitian symmetry that makes the z result real).
-static void fft3d_c2r_cpu(const cfloat* in_c, float* out_r, int nx, int ny, int nz) {
-    const int nzin = nz / 2 + 1;
-    vector<cfloat> work(static_cast<size_t>(nx) * ny * nzin);
-    for (int i = 0; i < nx*ny*nzin; i++) work[i] = in_c[i];
-
-    // Inverse FFT along x for each (y, kz).
-    vector<cfloat> col(nx);
-    for (int y = 0; y < ny; y++) {
-        for (int z = 0; z < nzin; z++) {
-            for (int x = 0; x < nx; x++) col[x] = work[(x*ny+y)*nzin+z];
-            fft1d_cpu(col.data(), nx, true);
-            for (int x = 0; x < nx; x++) work[(x*ny+y)*nzin+z] = col[x];
-        }
-    }
-
-    // Inverse FFT along y for each (x, kz).
-    vector<cfloat> row(ny);
-    for (int x = 0; x < nx; x++) {
-        for (int z = 0; z < nzin; z++) {
-            for (int y = 0; y < ny; y++) row[y] = work[(x*ny+y)*nzin+z];
-            fft1d_cpu(row.data(), ny, true);
-            for (int y = 0; y < ny; y++) work[(x*ny+y)*nzin+z] = row[y];
-        }
-    }
-
-    // C2R along z for each (x, y): reconstruct Hermitian-symmetric full spectrum,
-    // inverse FFT, take real part.
-    vector<cfloat> ztmp(nz);
-    for (int xy = 0; xy < nx*ny; xy++) {
-        const cfloat* wz = work.data() + xy*nzin;
-        for (int k = 0; k < nzin; k++) ztmp[k] = wz[k];
-        // Hermitian fill: ztmp[nz-k] = conj(ztmp[k]) for k = 1..(nz/2 - 1).
-        for (int k = 1; k*2 < nz; k++) ztmp[nz-k] = conj(ztmp[k]);
-        fft1d_cpu(ztmp.data(), nz, true);
-        for (int z = 0; z < nz; z++)
-            out_r[xy*nz+z] = ztmp[z].real();
-    }
-}
-
-// 3D C2C FFT (in-place): complex[nx][ny][nz].
-static void fft3d_c2c_cpu(cfloat* data, int nx, int ny, int nz, bool inverse) {
-    for (int xy = 0; xy < nx*ny; xy++)
-        fft1d_cpu(data + xy*nz, nz, inverse);
-
-    vector<cfloat> row(ny);
-    for (int x = 0; x < nx; x++) {
-        for (int z = 0; z < nz; z++) {
-            for (int y = 0; y < ny; y++) row[y] = data[(x*ny+y)*nz+z];
-            fft1d_cpu(row.data(), ny, inverse);
-            for (int y = 0; y < ny; y++) data[(x*ny+y)*nz+z] = row[y];
-        }
-    }
-
-    vector<cfloat> col(nx);
-    for (int y = 0; y < ny; y++) {
-        for (int z = 0; z < nz; z++) {
-            for (int x = 0; x < nx; x++) col[x] = data[(x*ny+y)*nz+z];
-            fft1d_cpu(col.data(), nx, inverse);
-            for (int x = 0; x < nx; x++) data[(x*ny+y)*nz+z] = col[x];
-        }
-    }
-}
-// ============================================================
-
-HipFFT3D::HipFFT3D(HipContext& context, int xsize, int ysize, int zsize, bool realToComplex, hipStream_t stream, HipArray& in, HipArray& out) :
-        context(context), stream(stream), cpuFallback(false), xsize(xsize), ysize(ysize), zsize(zsize), isRealToComplex(realToComplex) {
-
-    deviceIndex = context.getDeviceIndex();
-    inputBuffer = in.getDevicePointer();
-    outputBuffer = out.getDevicePointer();
-    size_t valueSize = context.getUseDoublePrecision() ? sizeof(double) : sizeof(float);
-    inputBufferSize = zsize * ysize * xsize * valueSize;
+HipFFT3D::HipFFT3D(HipContext& context, int xsize, int ysize, int zsize, bool realToComplex) :
+        context(context), xsize(xsize), ysize(ysize), zsize(zsize) {
+    packRealAsComplex = false;
+    int packedXSize = xsize;
+    int packedYSize = ysize;
+    int packedZSize = zsize;
     if (realToComplex) {
-        outputBufferSize = (zsize/2 + 1) * ysize * xsize * valueSize * 2;
-    }
-    else {
-        outputBufferSize = zsize * ysize * xsize * valueSize;
-    }
+        // If any axis size is even, we can pack the real values into a complex grid that is only half as large.
+        // Look for an appropriate axis.
 
-    // Use a CPU FFT fallback on Intel Arc via chipStar/CHIP-SPV. VkFFT generates HIP kernels
-    // compiled by IGC, whose JIT optimizations reorder floating-point operations between runs,
-    // producing non-deterministic results that prevent DIIS convergence. The CPU implementation
-    // is deterministic. Only enabled for single precision (double is broken on Intel Arc anyway).
-    bool intelGPU = !context.getSupportsHardwareFloatGlobalAtomicAdd();
-    if (getenv("OPENMM_HIP_FFT_FORCE_GPU") != nullptr) intelGPU = false;
-    if (intelGPU && !context.getUseDoublePrecision()) {
-        cpuFallback = true;
-        app = nullptr;
-        // Allocate CPU buffers with correct sizes (pmeGrid uses 2*valueSize per element for complex).
-        size_t inBytes  = static_cast<size_t>(xsize) * ysize * zsize * sizeof(float);         // real input
-        size_t outBytes = static_cast<size_t>(xsize) * ysize * (zsize/2+1) * 2 * sizeof(float); // complex output
-        size_t c2cBytes = static_cast<size_t>(xsize) * ysize * zsize * 2 * sizeof(float);     // C2C
-        cpuInBuf.resize(realToComplex ? inBytes  : c2cBytes);
-        cpuOutBuf.resize(realToComplex ? outBytes : c2cBytes);
-        return;
-    }
-
-    VkFFTConfiguration configuration = {};
-    configuration.performR2C = realToComplex;
-    configuration.device = &deviceIndex;
-    configuration.num_streams = 1;
-    configuration.stream = &this->stream;
-    configuration.doublePrecision = context.getUseDoublePrecision();
-
-    configuration.FFTdim = 3;
-    configuration.size[0] = zsize;
-    configuration.size[1] = ysize;
-    configuration.size[2] = xsize;
-
-    configuration.inverseReturnToInputBuffer = true;
-    configuration.isInputFormatted = true;
-    configuration.inputBufferSize = &inputBufferSize;
-    configuration.inputBuffer = &inputBuffer;
-    configuration.inputBufferStride[0] = zsize;
-    configuration.inputBufferStride[1] = configuration.inputBufferStride[0] * ysize;
-    configuration.inputBufferStride[2] = configuration.inputBufferStride[1] * xsize;
-
-    configuration.bufferSize = &outputBufferSize;
-    configuration.buffer = &outputBuffer;
-    configuration.bufferStride[0] = realToComplex ? (zsize/2 + 1) : zsize;
-    configuration.bufferStride[1] = configuration.bufferStride[0] * ysize;
-    configuration.bufferStride[2] = configuration.bufferStride[1] * xsize;
-
-    // Limit VkFFT to ≤512 threads per block. Intel Arc via CHIP-SPV has a hard
-    // OpenCL WGS limit of 512; CHIP-SPV does not fill hipDeviceProp_t reliably
-    // so we cannot auto-detect. 512 is also a safe bound on AMD/CUDA.
-    configuration.maxThreadsNum = 512;
-
-    // On Intel Arc via chipStar, force LUT twiddle factors. The CPU fallback handles the
-    // non-determinism fix; this is just a belt-and-suspenders measure for double-precision mode.
-    if (intelGPU)
-        configuration.useLUT = 1;
-
-    // Combine all parameters into a unique key
-    stringstream info;
-    int runtimeVersion;
-    (void)hipRuntimeGetVersion(&runtimeVersion);
-    info << runtimeVersion;
-    info << " " << VkFFTGetVersion();
-    info << " " << xsize << " " << ysize << " " << zsize;
-    info << " " << realToComplex << " " << context.getUseDoublePrecision()
-         << " " << (int)configuration.useLUT;
-
-    string cacheFile = context.getCacheFileName(info.str());
-
-    bool hasCache = false;
-    vector<char> cacheContent;
-
-    ifstream cache(cacheFile.c_str(), ios::in | ios::binary);
-    if (cache.is_open()) {
-        cacheContent.insert(cacheContent.begin(), istreambuf_iterator<char>(cache), istreambuf_iterator<char>());
-        cache.close();
-        hasCache = true;
-        // There is an existing cache, load VkFFT kernels from it
-        configuration.loadApplicationFromString = 1;
-        configuration.loadApplicationString = cacheContent.data();
-    }
-    else {
-        // There is no existing cache, request saving
-        configuration.saveApplicationToString = 1;
-    }
-
-    app = new VkFFTApplication();
-    VkFFTResult fftResult = initializeVkFFT(app, configuration);
-    if (fftResult != VKFFT_SUCCESS) {
-        throw OpenMMException("Error executing initializeVkFFT: "+context.intToString(fftResult));
-    }
-
-    if (!hasCache) {
-        // There is no existing cache, create it
-        string outputFile = context.getTempFileName() + ".vkfftcache";
-        try {
-            ofstream out(outputFile.c_str(), ios::out | ios::binary);
-            out.write(reinterpret_cast<char*>(app->saveApplicationString), size_t(app->applicationStringSize));
-            out.close();
-            if (!out.fail()) {
-                if (rename(outputFile.c_str(), cacheFile.c_str()) != 0)
-                    remove(outputFile.c_str());
-            }
+        packRealAsComplex = true;
+        int packedAxis, bufferSize;
+        if (xsize%2 == 0) {
+            packedAxis = 0;
+            packedXSize /= 2;
+            bufferSize = packedXSize;
         }
-        catch (...) {
-            // An error occurred.  Possibly we don't have permission to write to the temp directory.
+        else if (ysize%2 == 0) {
+            packedAxis = 1;
+            packedYSize /= 2;
+            bufferSize = packedYSize;
+        }
+        else if (zsize%2 == 0) {
+            packedAxis = 2;
+            packedZSize /= 2;
+            bufferSize = packedZSize;
+        }
+        else
+            packRealAsComplex = false;
+        if (packRealAsComplex) {
+            // Build the kernels for packing and unpacking the data.
+
+            map<string, string> defines;
+            defines["XSIZE"] = context.intToString(xsize);
+            defines["YSIZE"] = context.intToString(ysize);
+            defines["ZSIZE"] = context.intToString(zsize);
+            defines["PACKED_AXIS"] = context.intToString(packedAxis);
+            defines["PACKED_XSIZE"] = context.intToString(packedXSize);
+            defines["PACKED_YSIZE"] = context.intToString(packedYSize);
+            defines["PACKED_ZSIZE"] = context.intToString(packedZSize);
+            defines["M_PI"] = context.doubleToString(M_PI);
+            hipModule_t module = context.createModule(HipKernelSources::vectorOps+HipKernelSources::fftR2C, defines);
+            packForwardKernel = context.getKernel(module, "packForwardData");
+            unpackForwardKernel = context.getKernel(module, "unpackForwardData");
+            packBackwardKernel = context.getKernel(module, "packBackwardData");
+            unpackBackwardKernel = context.getKernel(module, "unpackBackwardData");
         }
     }
+    bool inputIsReal = (realToComplex && !packRealAsComplex);
+    zkernel = createKernel(packedXSize, packedYSize, packedZSize, zthreads, 0, true, inputIsReal);
+    xkernel = createKernel(packedYSize, packedZSize, packedXSize, xthreads, 1, true, inputIsReal);
+    ykernel = createKernel(packedZSize, packedXSize, packedYSize, ythreads, 2, true, inputIsReal);
+    invzkernel = createKernel(packedXSize, packedYSize, packedZSize, zthreads, 0, false, inputIsReal);
+    invxkernel = createKernel(packedYSize, packedZSize, packedXSize, xthreads, 1, false, inputIsReal);
+    invykernel = createKernel(packedZSize, packedXSize, packedYSize, ythreads, 2, false, inputIsReal);
 }
 
-HipFFT3D::~HipFFT3D() {
-    if (app != nullptr) {
-        deleteVkFFT(app);
-        delete app;
-    }
-}
+void HipFFT3D::execFFT(HipArray& in, HipArray& out, bool forward) {
+    hipFunction_t kernel1 = (forward ? zkernel : invzkernel);
+    hipFunction_t kernel2 = (forward ? xkernel : invxkernel);
+    hipFunction_t kernel3 = (forward ? ykernel : invykernel);
+    void* args1[] = {&in.getDevicePointer(), &out.getDevicePointer()};
+    void* args2[] = {&out.getDevicePointer(), &in.getDevicePointer()};
+    if (packRealAsComplex) {
+        hipFunction_t packKernel = (forward ? packForwardKernel : packBackwardKernel);
+        hipFunction_t unpackKernel = (forward ? unpackForwardKernel : unpackBackwardKernel);
+        int gridSize = xsize*ysize*zsize/2;
 
-void HipFFT3D::execFFT(bool forward) {
-    if (cpuFallback) {
-        // Synchronize the stream so GPU writes to the source buffer are complete before we read it.
-        hipStreamSynchronize(stream);
-        if (isRealToComplex) {
-            if (forward) {
-                // R2C: inputBuffer (GPU float[nx][ny][nz]) → outputBuffer (GPU cfloat[nx][ny][nzout])
-                hipMemcpy(cpuInBuf.data(), inputBuffer, cpuInBuf.size(), hipMemcpyDeviceToHost);
-                fft3d_r2c_cpu(reinterpret_cast<const float*>(cpuInBuf.data()),
-                               reinterpret_cast<cfloat*>(cpuOutBuf.data()),
-                               xsize, ysize, zsize);
-                hipMemcpy(outputBuffer, cpuOutBuf.data(), cpuOutBuf.size(), hipMemcpyHostToDevice);
-            } else {
-                // C2R: outputBuffer (GPU cfloat[nx][ny][nzout]) → inputBuffer (GPU float[nx][ny][nz])
-                hipMemcpy(cpuOutBuf.data(), outputBuffer, cpuOutBuf.size(), hipMemcpyDeviceToHost);
-                fft3d_c2r_cpu(reinterpret_cast<const cfloat*>(cpuOutBuf.data()),
-                               reinterpret_cast<float*>(cpuInBuf.data()),
-                               xsize, ysize, zsize);
-                hipMemcpy(inputBuffer, cpuInBuf.data(), cpuInBuf.size(), hipMemcpyHostToDevice);
-            }
-        } else {
-            // C2C: inputBuffer and outputBuffer are both complex[nx][ny][nz] (2 floats per element).
-            if (forward) {
-                hipMemcpy(cpuInBuf.data(), inputBuffer, cpuInBuf.size(), hipMemcpyDeviceToHost);
-                fft3d_c2c_cpu(reinterpret_cast<cfloat*>(cpuInBuf.data()), xsize, ysize, zsize, false);
-                hipMemcpy(outputBuffer, cpuInBuf.data(), cpuInBuf.size(), hipMemcpyHostToDevice);
-            } else {
-                hipMemcpy(cpuInBuf.data(), outputBuffer, cpuInBuf.size(), hipMemcpyDeviceToHost);
-                fft3d_c2c_cpu(reinterpret_cast<cfloat*>(cpuInBuf.data()), xsize, ysize, zsize, true);
-                hipMemcpy(inputBuffer, cpuInBuf.data(), cpuInBuf.size(), hipMemcpyHostToDevice);
-            }
-        }
-        return;
+        // Pack the data into a half sized grid.
+
+        context.executeKernel(packKernel, args1, gridSize, 128);
+
+        // Perform the FFT.
+
+        context.executeKernel(kernel1, args2, gridSize, zthreads);
+        context.executeKernel(kernel2, args1, gridSize, xthreads);
+        context.executeKernel(kernel3, args2, gridSize, ythreads);
+
+        // Unpack the data.
+
+        context.executeKernel(unpackKernel, args1, gridSize, 128);
     }
-    VkFFTResult fftResult = VkFFTAppend(app, forward ? -1 : 1, NULL);
-    if (fftResult != VKFFT_SUCCESS) {
-        throw OpenMMException("Error executing VkFFTAppend: "+context.intToString(fftResult));
+    else {
+        context.executeKernel(kernel1, args1, xsize*ysize*zsize, zthreads);
+        context.executeKernel(kernel2, args2, xsize*ysize*zsize, xthreads);
+        context.executeKernel(kernel3, args1, xsize*ysize*zsize, ythreads);
     }
 }
 
@@ -361,25 +132,221 @@ int HipFFT3D::findLegalDimension(int minimum) {
         // Attempt to factor the current value.
 
         int unfactored = minimum;
-        bool valid = true;
-        // VkFFT supports prime factors up to 13, but IGC on Intel Arc
-        // miscompiles radix-11 and radix-13 kernels (wrong FFT output).
-        // Restrict to prime factors ≤7 to avoid those code paths.
-        for (int factor = 2; factor <= 7 && unfactored > 1; factor++) {
-            int count = 0;
-            while (unfactored % factor == 0) {
+        for (int factor = 2; factor < 8; factor++) {
+            while (unfactored > 1 && unfactored%factor == 0)
                 unfactored /= factor;
-                count++;
-            }
-            // For odd prime factors, avoid ≥5 occurrences (e.g. 3^5=243, 5^5=3125).
-            // Such dimensions cause non-deterministic VkFFT kernel failures on Intel Arc
-            // due to race conditions in the generated multi-stage butterfly kernels.
-            // Powers of 2 (factor==2) are exempt: VkFFT handles those correctly.
-            if (factor > 2 && count >= 5)
-                valid = false;
         }
-        if (unfactored == 1 && valid)
+        if (unfactored == 1)
             return minimum;
         minimum++;
     }
+}
+
+
+static int getSmallestRadix(int size) {
+    int minRadix = 1;
+    int unfactored = size;
+    while (unfactored%7 == 0) {
+        minRadix = 7;
+        unfactored /= 7;
+    }
+    while (unfactored%5 == 0) {
+        minRadix = 5;
+        unfactored /= 5;
+    }
+    while (unfactored%4 == 0) {
+        minRadix = 4;
+        unfactored /= 4;
+    }
+    while (unfactored%3 == 0) {
+        minRadix = 3;
+        unfactored /= 3;
+    }
+    while (unfactored%2 == 0) {
+        minRadix = 2;
+        unfactored /= 2;
+    }
+    return minRadix;
+}
+
+hipFunction_t HipFFT3D::createKernel(int xsize, int ysize, int zsize, int& threads, int axis, bool forward, bool inputIsReal) {
+    int maxThreads = (context.getUseDoublePrecision() ? 128 : 256);
+//    while (maxThreads > 128 && maxThreads-64 >= zsize)
+//        maxThreads -= 64;
+    int threadsPerBlock = zsize/getSmallestRadix(zsize);
+    stringstream source;
+    int blocksPerGroup = max(1, maxThreads/threadsPerBlock);
+    int stage = 0;
+    int L = zsize;
+    int m = 1;
+
+    // Factor zsize, generating an appropriate block of code for each factor.
+
+    while (L > 1) {
+        int input = stage%2;
+        int output = 1-input;
+        int radix;
+        if (L%7 == 0)
+            radix = 7;
+        else if (L%5 == 0)
+            radix = 5;
+        else if (L%4 == 0)
+            radix = 4;
+        else if (L%3 == 0)
+            radix = 3;
+        else if (L%2 == 0)
+            radix = 2;
+        else
+            throw OpenMMException("Illegal size for FFT: "+context.intToString(zsize));
+        source<<"{\n";
+        L = L/radix;
+        source<<"// Pass "<<(stage+1)<<" (radix "<<radix<<")\n";
+        if (L*m < threadsPerBlock)
+            source<<"if (threadIdx.x < "<<(blocksPerGroup*L*m)<<") {\n";
+        else
+            source<<"{\n";
+        source<<"int block = threadIdx.x/"<<(L*m)<<";\n";
+        source<<"int i = threadIdx.x-block*"<<(L*m)<<";\n";
+        source<<"int base = i+block*"<<zsize<<";\n";
+        source<<"int j = i/"<<m<<";\n";
+        if (radix == 7) {
+            source<<"real2 c0 = data"<<input<<"[base];\n";
+            source<<"real2 c1 = data"<<input<<"[base+"<<(L*m)<<"];\n";
+            source<<"real2 c2 = data"<<input<<"[base+"<<(2*L*m)<<"];\n";
+            source<<"real2 c3 = data"<<input<<"[base+"<<(3*L*m)<<"];\n";
+            source<<"real2 c4 = data"<<input<<"[base+"<<(4*L*m)<<"];\n";
+            source<<"real2 c5 = data"<<input<<"[base+"<<(5*L*m)<<"];\n";
+            source<<"real2 c6 = data"<<input<<"[base+"<<(6*L*m)<<"];\n";
+            source<<"real2 d0 = c1+c6;\n";
+            source<<"real2 d1 = c1-c6;\n";
+            source<<"real2 d2 = c2+c5;\n";
+            source<<"real2 d3 = c2-c5;\n";
+            source<<"real2 d4 = c4+c3;\n";
+            source<<"real2 d5 = c4-c3;\n";
+            source<<"real2 d6 = d2+d0;\n";
+            source<<"real2 d7 = d5+d3;\n";
+            source<<"real2 b0 = c0+d6+d4;\n";
+            source<<"real2 b1 = "<<context.doubleToString((cos(2*M_PI/7)+cos(4*M_PI/7)+cos(6*M_PI/7))/3-1)<<"*(d6+d4);\n";
+            source<<"real2 b2 = "<<context.doubleToString((2*cos(2*M_PI/7)-cos(4*M_PI/7)-cos(6*M_PI/7))/3)<<"*(d0-d4);\n";
+            source<<"real2 b3 = "<<context.doubleToString((cos(2*M_PI/7)-2*cos(4*M_PI/7)+cos(6*M_PI/7))/3)<<"*(d4-d2);\n";
+            source<<"real2 b4 = "<<context.doubleToString((cos(2*M_PI/7)+cos(4*M_PI/7)-2*cos(6*M_PI/7))/3)<<"*(d2-d0);\n";
+            source<<"real2 b5 = -(SIGN)*"<<context.doubleToString((sin(2*M_PI/7)+sin(4*M_PI/7)-sin(6*M_PI/7))/3)<<"*(d7+d1);\n";
+            source<<"real2 b6 = -(SIGN)*"<<context.doubleToString((2*sin(2*M_PI/7)-sin(4*M_PI/7)+sin(6*M_PI/7))/3)<<"*(d1-d5);\n";
+            source<<"real2 b7 = -(SIGN)*"<<context.doubleToString((sin(2*M_PI/7)-2*sin(4*M_PI/7)-sin(6*M_PI/7))/3)<<"*(d5-d3);\n";
+            source<<"real2 b8 = -(SIGN)*"<<context.doubleToString((sin(2*M_PI/7)+sin(4*M_PI/7)+2*sin(6*M_PI/7))/3)<<"*(d3-d1);\n";
+            source<<"real2 t0 = b0+b1;\n";
+            source<<"real2 t1 = b2+b3;\n";
+            source<<"real2 t2 = b4-b3;\n";
+            source<<"real2 t3 = -b2-b4;\n";
+            source<<"real2 t4 = b6+b7;\n";
+            source<<"real2 t5 = b8-b7;\n";
+            source<<"real2 t6 = -b8-b6;\n";
+            source<<"real2 t7 = t0+t1;\n";
+            source<<"real2 t8 = t0+t2;\n";
+            source<<"real2 t9 = t0+t3;\n";
+            source<<"real2 t10 = make_real2(t4.y+b5.y, -(t4.x+b5.x));\n";
+            source<<"real2 t11 = make_real2(t5.y+b5.y, -(t5.x+b5.x));\n";
+            source<<"real2 t12 = make_real2(t6.y+b5.y, -(t6.x+b5.x));\n";
+            source<<"data"<<output<<"[base+6*j*"<<m<<"] = b0;\n";
+            source<<"data"<<output<<"[base+(6*j+1)*"<<m<<"] = multiplyComplex(w[j*"<<zsize<<"/"<<(7*L)<<"], t7-t10);\n";
+            source<<"data"<<output<<"[base+(6*j+2)*"<<m<<"] = multiplyComplex(w[j*"<<(2*zsize)<<"/"<<(7*L)<<"], t9-t12);\n";
+            source<<"data"<<output<<"[base+(6*j+3)*"<<m<<"] = multiplyComplex(w[j*"<<(3*zsize)<<"/"<<(7*L)<<"], t8+t11);\n";
+            source<<"data"<<output<<"[base+(6*j+4)*"<<m<<"] = multiplyComplex(w[j*"<<(4*zsize)<<"/"<<(7*L)<<"], t8-t11);\n";
+            source<<"data"<<output<<"[base+(6*j+5)*"<<m<<"] = multiplyComplex(w[j*"<<(5*zsize)<<"/"<<(7*L)<<"], t9+t12);\n";
+            source<<"data"<<output<<"[base+(6*j+6)*"<<m<<"] = multiplyComplex(w[j*"<<(6*zsize)<<"/"<<(7*L)<<"], t7+t10);\n";
+        }
+        else if (radix == 5) {
+            source<<"real2 c0 = data"<<input<<"[base];\n";
+            source<<"real2 c1 = data"<<input<<"[base+"<<(L*m)<<"];\n";
+            source<<"real2 c2 = data"<<input<<"[base+"<<(2*L*m)<<"];\n";
+            source<<"real2 c3 = data"<<input<<"[base+"<<(3*L*m)<<"];\n";
+            source<<"real2 c4 = data"<<input<<"[base+"<<(4*L*m)<<"];\n";
+            source<<"real2 d0 = c1+c4;\n";
+            source<<"real2 d1 = c2+c3;\n";
+            source<<"real2 d2 = "<<context.doubleToString(sin(0.4*M_PI))<<"*(c1-c4);\n";
+            source<<"real2 d3 = "<<context.doubleToString(sin(0.4*M_PI))<<"*(c2-c3);\n";
+            source<<"real2 d4 = d0+d1;\n";
+            source<<"real2 d5 = "<<context.doubleToString(0.25*sqrt(5.0))<<"*(d0-d1);\n";
+            source<<"real2 d6 = c0-0.25f*d4;\n";
+            source<<"real2 d7 = d6+d5;\n";
+            source<<"real2 d8 = d6-d5;\n";
+            string coeff = context.doubleToString(sin(0.2*M_PI)/sin(0.4*M_PI));
+            source<<"real2 d9 = (SIGN)*make_real2(d2.y+"<<coeff<<"*d3.y, -d2.x-"<<coeff<<"*d3.x);\n";
+            source<<"real2 d10 = (SIGN)*make_real2("<<coeff<<"*d2.y-d3.y, d3.x-"<<coeff<<"*d2.x);\n";
+            source<<"data"<<output<<"[base+4*j*"<<m<<"] = c0+d4;\n";
+            source<<"data"<<output<<"[base+(4*j+1)*"<<m<<"] = multiplyComplex(w[j*"<<zsize<<"/"<<(5*L)<<"], d7+d9);\n";
+            source<<"data"<<output<<"[base+(4*j+2)*"<<m<<"] = multiplyComplex(w[j*"<<(2*zsize)<<"/"<<(5*L)<<"], d8+d10);\n";
+            source<<"data"<<output<<"[base+(4*j+3)*"<<m<<"] = multiplyComplex(w[j*"<<(3*zsize)<<"/"<<(5*L)<<"], d8-d10);\n";
+            source<<"data"<<output<<"[base+(4*j+4)*"<<m<<"] = multiplyComplex(w[j*"<<(4*zsize)<<"/"<<(5*L)<<"], d7-d9);\n";
+        }
+        else if (radix == 4) {
+            source<<"real2 c0 = data"<<input<<"[base];\n";
+            source<<"real2 c1 = data"<<input<<"[base+"<<(L*m)<<"];\n";
+            source<<"real2 c2 = data"<<input<<"[base+"<<(2*L*m)<<"];\n";
+            source<<"real2 c3 = data"<<input<<"[base+"<<(3*L*m)<<"];\n";
+            source<<"real2 d0 = c0+c2;\n";
+            source<<"real2 d1 = c0-c2;\n";
+            source<<"real2 d2 = c1+c3;\n";
+            source<<"real2 d3 = (SIGN)*make_real2(c1.y-c3.y, c3.x-c1.x);\n";
+            source<<"data"<<output<<"[base+3*j*"<<m<<"] = d0+d2;\n";
+            source<<"data"<<output<<"[base+(3*j+1)*"<<m<<"] = multiplyComplex(w[j*"<<zsize<<"/"<<(4*L)<<"], d1+d3);\n";
+            source<<"data"<<output<<"[base+(3*j+2)*"<<m<<"] = multiplyComplex(w[j*"<<(2*zsize)<<"/"<<(4*L)<<"], d0-d2);\n";
+            source<<"data"<<output<<"[base+(3*j+3)*"<<m<<"] = multiplyComplex(w[j*"<<(3*zsize)<<"/"<<(4*L)<<"], d1-d3);\n";
+        }
+        else if (radix == 3) {
+            source<<"real2 c0 = data"<<input<<"[base];\n";
+            source<<"real2 c1 = data"<<input<<"[base+"<<(L*m)<<"];\n";
+            source<<"real2 c2 = data"<<input<<"[base+"<<(2*L*m)<<"];\n";
+            source<<"real2 d0 = c1+c2;\n";
+            source<<"real2 d1 = c0-0.5f*d0;\n";
+            source<<"real2 d2 = (SIGN)*"<<context.doubleToString(sin(M_PI/3.0))<<"*make_real2(c1.y-c2.y, c2.x-c1.x);\n";
+            source<<"data"<<output<<"[base+2*j*"<<m<<"] = c0+d0;\n";
+            source<<"data"<<output<<"[base+(2*j+1)*"<<m<<"] = multiplyComplex(w[j*"<<zsize<<"/"<<(3*L)<<"], d1+d2);\n";
+            source<<"data"<<output<<"[base+(2*j+2)*"<<m<<"] = multiplyComplex(w[j*"<<(2*zsize)<<"/"<<(3*L)<<"], d1-d2);\n";
+        }
+        else if (radix == 2) {
+            source<<"real2 c0 = data"<<input<<"[base];\n";
+            source<<"real2 c1 = data"<<input<<"[base+"<<(L*m)<<"];\n";
+            source<<"data"<<output<<"[base+j*"<<m<<"] = c0+c1;\n";
+            source<<"data"<<output<<"[base+(j+1)*"<<m<<"] = multiplyComplex(w[j*"<<zsize<<"/"<<(2*L)<<"], c0-c1);\n";
+        }
+        source<<"}\n";
+        m = m*radix;
+        source<<"__syncthreads();\n";
+        source<<"}\n";
+        ++stage;
+    }
+
+    // Create the kernel.
+
+    bool outputIsReal = (inputIsReal && axis == 2 && !forward);
+    bool outputIsPacked = (inputIsReal && axis == 2 && forward);
+    string outputSuffix = (outputIsReal ? ".x" : "");
+    if (outputIsPacked)
+        source<<"if (index < XSIZE*YSIZE && x < XSIZE/2+1)\n";
+    else
+        source<<"if (index < XSIZE*YSIZE)\n";
+    source<<"for (int i = threadIdx.x-block*THREADS_PER_BLOCK; i < ZSIZE; i += THREADS_PER_BLOCK)\n";
+    if (outputIsPacked)
+        source<<"out[y*(ZSIZE*(XSIZE/2+1))+i*(XSIZE/2+1)+x] = data"<<(stage%2)<<"[i+block*ZSIZE]"<<outputSuffix<<";\n";
+    else
+            source<<"out[y*(ZSIZE*XSIZE)+i*XSIZE+x] = data"<<(stage%2)<<"[i+block*ZSIZE]"<<outputSuffix<<";\n";
+    map<string, string> replacements;
+    replacements["XSIZE"] = context.intToString(xsize);
+    replacements["YSIZE"] = context.intToString(ysize);
+    replacements["ZSIZE"] = context.intToString(zsize);
+    replacements["BLOCKS_PER_GROUP"] = context.intToString(blocksPerGroup);
+    replacements["THREADS_PER_BLOCK"] = context.intToString(threadsPerBlock);
+    replacements["M_PI"] = context.doubleToString(M_PI);
+    replacements["COMPUTE_FFT"] = source.str();
+    replacements["SIGN"] = (forward ? "1" : "-1");
+    replacements["INPUT_TYPE"] = (inputIsReal && axis == 0 && forward ? "real" : "real2");
+    replacements["OUTPUT_TYPE"] = (outputIsReal ? "real" : "real2");
+    replacements["INPUT_IS_REAL"] = (inputIsReal && axis == 0 && forward ? "1" : "0");
+    replacements["INPUT_IS_PACKED"] = (inputIsReal && axis == 0 && !forward ? "1" : "0");
+    replacements["OUTPUT_IS_PACKED"] = (outputIsPacked ? "1" : "0");
+    hipModule_t module = context.createModule(HipKernelSources::vectorOps+context.replaceStrings(HipKernelSources::fft, replacements));
+    hipFunction_t kernel = context.getKernel(module, "execFFT");
+    threads = blocksPerGroup*threadsPerBlock;
+    return kernel;
 }

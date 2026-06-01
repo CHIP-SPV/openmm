@@ -36,6 +36,9 @@
 #include "HipSort.h"
 #include "HipFFT3D.h"
 #include "AmoebaCommonKernels.h"
+#ifdef OPENMM_HIP_WITH_HIPFFT
+#include <hipfft.h>
+#endif
 
 namespace OpenMM {
 
@@ -72,6 +75,10 @@ public:
 private:
     HipContext& cu;
     HipFFT3D* fft;
+#ifdef OPENMM_HIP_WITH_HIPFFT
+    hipfftHandle hipFft;
+    bool useHipFFT;
+#endif
 };
 
 /**
@@ -119,6 +126,10 @@ private:
     HipSort* sort;
     HipFFT3D* fft;
     HipFFT3D* dfft;
+#ifdef OPENMM_HIP_WITH_HIPFFT
+    hipfftHandle fftForward, fftBackward, dfftForward, dfftBackward;
+    bool useHipFFT;
+#endif
 };
 
 } // namespace OpenMM
