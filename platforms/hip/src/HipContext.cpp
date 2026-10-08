@@ -503,7 +503,7 @@ hipModule_t HipContext::createModule(const string source, const map<string, stri
         // Workaround for operator* defined for complex types (typedefs for float2, double2) in
         // ROCm 6.0 headers. This issue has been fixed in 6.1. hipRTC includes amd_hip_complex.h
         // by default, we fool the include guard into thinking the header is already included.
-        options += " -D HIP_INCLUDE_HIP_AMD_DETAIL_HIP_COMPLEX_H";
+        options += " -DHIP_INCLUDE_HIP_AMD_DETAIL_HIP_COMPLEX_H";
     }
     stringstream src;
     src << "// Compilation Options: " << options << endl << endl;
