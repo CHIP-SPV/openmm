@@ -24,6 +24,21 @@ T warpShuffle(const T& input, const int src_lane) {
     return output;
 }
 
+#ifndef __HIP_PLATFORM_AMD__
+// WORKAROUND(CHIP-SPV/chipStar#1896): IGC miscompiles an in-place SIMD32 shuffle of an int view of a float; shuffle floats as float. Remove when IGC is fixed.
+static __inline__ __device__ float warpShuffle(const float& input, const int src_lane) {
+    return __shfl(input, src_lane);
+}
+
+static __inline__ __device__ float3 warpShuffle(const float3& input, const int src_lane) {
+    return make_float3(__shfl(input.x, src_lane), __shfl(input.y, src_lane), __shfl(input.z, src_lane));
+}
+
+static __inline__ __device__ float4 warpShuffle(const float4& input, const int src_lane) {
+    return make_float4(__shfl(input.x, src_lane), __shfl(input.y, src_lane), __shfl(input.z, src_lane), __shfl(input.w, src_lane));
+}
+#endif
+
 #if defined(AMD_RDNA)
 
 // RDNA: device warp size = tile size = 32
