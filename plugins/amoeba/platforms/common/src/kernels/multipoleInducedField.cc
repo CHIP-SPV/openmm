@@ -792,7 +792,7 @@ KERNEL void solveDIISMatrix(int iteration, GLOBAL const real* RESTRICT matrix, G
         // Solve b*Y = X(piv)
         
         for (int i = 0; i < rank; i++) 
-            x[i] = (piv[i] == 0 ? -1 : 0);
+            x[i] = (piv[i] == 0 ? (real) -1 : (real) 0);
         for (int k = 0; k < rank; k++)
             for (int i = k+1; i < rank; i++)
                 x[i] -= x[k] * b[i][k];
