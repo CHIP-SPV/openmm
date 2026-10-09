@@ -24,6 +24,25 @@ T warpShuffle(const T& input, const int src_lane) {
     return output;
 }
 
+#ifndef __AMDGCN__
+// Shuffle floats as float: IGC miscompiles shuffles of their int bit patterns (https://github.com/CHIP-SPV/chipStar/issues/1896).
+static __inline__ __device__ float warpShuffle(const float& input, const int src_lane) {
+    return __shfl(input, src_lane);
+}
+
+static __inline__ __device__ float2 warpShuffle(const float2& input, const int src_lane) {
+    return make_float2(__shfl(input.x, src_lane), __shfl(input.y, src_lane));
+}
+
+static __inline__ __device__ float3 warpShuffle(const float3& input, const int src_lane) {
+    return make_float3(__shfl(input.x, src_lane), __shfl(input.y, src_lane), __shfl(input.z, src_lane));
+}
+
+static __inline__ __device__ float4 warpShuffle(const float4& input, const int src_lane) {
+    return make_float4(__shfl(input.x, src_lane), __shfl(input.y, src_lane), __shfl(input.z, src_lane), __shfl(input.w, src_lane));
+}
+#endif
+
 #if defined(AMD_RDNA)
 
 // RDNA: device warp size = tile size = 32
